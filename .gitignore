@@ -1,0 +1,29 @@
+# Compiled output
+/target
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+
+# Virtual environments
+.venv
+venv
+env
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Output artifacts (generated)
+output/
+*.jsonl
+
+# Secrets
+.env
+*.env.local

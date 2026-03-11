@@ -1,0 +1,22 @@
+[package]
+name = "rlrgf-audit"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rlrgf-models = { path = "../models" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[features]
+postgres = ["sqlx"]
+
+[dependencies.sqlx]
+workspace = true
+optional = true

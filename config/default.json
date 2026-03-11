@@ -1,0 +1,41 @@
+{
+    "server": {
+        "host": "0.0.0.0",
+        "port": 8080,
+        "log_level": "info"
+    },
+    "database": {
+        "url": "postgresql://localhost:5432/rlrgf",
+        "max_connections": 10
+    },
+    "vector_db": {
+        "url": "http://localhost:6334",
+        "collection_name": "rlrgf_chunks",
+        "embedding_dimension": 384
+    },
+    "chunking": {
+        "chunk_size_tokens": 256,
+        "overlap_tokens": 64,
+        "min_chunk_tokens": 32
+    },
+    "retrieval": {
+        "default_top_k": 5,
+        "min_similarity_threshold": 0.3
+    },
+    "guardrails": {
+        "max_context_tokens": 2048,
+        "per_document_token_quota": 512,
+        "enable_pii_redaction": true,
+        "enable_injection_detection": true
+    },
+    "council": {
+        "grounding_threshold": 0.6,
+        "disagreement_threshold": 0.4,
+        "strict_safety": true
+    },
+    "experiment": {
+        "experiment_id": "default",
+        "output_dir": "./output",
+        "export_format": "jsonl"
+    }
+}

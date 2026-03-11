@@ -1,0 +1,58 @@
+[workspace]
+members = [
+    "crates/ingestion",
+    "crates/retrieval",
+    "crates/models",
+    "crates/api-server",
+    "crates/audit",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["RLRGF Team"]
+license = "MIT"
+
+[workspace.dependencies]
+# Async Runtime
+tokio = { version = "1", features = ["full"] }
+
+# Web Framework
+axum = { version = "0.7", features = ["json", "multipart"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Database
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "uuid", "time", "json"] }
+
+# Vector DB
+qdrant-client = "1.7"
+
+# IDs & Time
+uuid = { version = "1", features = ["v4", "serde"] }
+time = { version = "0.3", features = ["serde", "formatting"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# Error Handling
+anyhow = "1"
+thiserror = "1"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Hashing
+sha2 = "0.10"
+hex = "0.4"
+
+# Text Processing
+tiktoken-rs = "0.5"
+regex = "1"
+
+# PDF
+# lopdf = "0.31"

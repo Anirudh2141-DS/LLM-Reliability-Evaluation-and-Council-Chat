@@ -1,0 +1,22 @@
+[package]
+name = "rlrgf-retrieval"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rlrgf-models = { path = "../models" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[features]
+qdrant = ["qdrant-client"]
+
+[dependencies.qdrant-client]
+workspace = true
+optional = true
