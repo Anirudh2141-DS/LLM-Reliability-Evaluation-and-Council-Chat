@@ -14,9 +14,11 @@ import math
 import logging
 import re
 import random
+from dataclasses import asdict, dataclass
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from datetime import datetime
+from typing import Any, Optional
 from uuid import uuid4
 
 # --- Paths and Data ---
@@ -1037,130 +1039,635 @@ def build_smalltalk_turn(prompt: str) -> dict:
 
 
 try:
-    from .runtime_registry import (
-        MODEL_STATUS_EVICTED,
-        MODEL_STATUS_NOT_MEASURED,
-        MODEL_STATUS_READY_CPU,
-        MODEL_STATUS_PROBE_FAILED,
-        MODEL_STATUS_READY,
-        MODEL_STATUS_REGISTERED,
-        MODEL_STATUS_UNAVAILABLE,
-        ModelRuntimeRegistry,
-        choose_council_answer,
-        summarize_model_health,
+    from .council_runtime import CouncilRuntime
+    from .council_runtime_config import CouncilRuntimeConfig, load_runtime_config
+    from .council_runtime_schemas import (
+        AvailabilityStatus,
+        CouncilMode,
+        CouncilRequest,
+        CouncilRunTrace,
+        CouncilSeat,
+        FailureFlag,
     )
 except ImportError:
     # Support Streamlit script execution (python path) and package execution.
-    from rlrgf.runtime_registry import (
-        MODEL_STATUS_EVICTED,
-        MODEL_STATUS_NOT_MEASURED,
-        MODEL_STATUS_READY_CPU,
-        MODEL_STATUS_PROBE_FAILED,
-        MODEL_STATUS_READY,
-        MODEL_STATUS_REGISTERED,
-        MODEL_STATUS_UNAVAILABLE,
-        ModelRuntimeRegistry,
-        choose_council_answer,
-        summarize_model_health,
+    from rlrgf.council_runtime import CouncilRuntime
+    from rlrgf.council_runtime_config import CouncilRuntimeConfig, load_runtime_config
+    from rlrgf.council_runtime_schemas import (
+        AvailabilityStatus,
+        CouncilMode,
+        CouncilRequest,
+        CouncilRunTrace,
+        CouncilSeat,
+        FailureFlag,
     )
-from uuid import uuid4
-
-def get_runtime_registry() -> ModelRuntimeRegistry:
-    registry = st.session_state.get("model_runtime_registry")
-    if registry is None:
-        registry = ModelRuntimeRegistry()
-        st.session_state["model_runtime_registry"] = registry
-    return registry
-
-
-def run_council(prompt: str, context: str, models: list[str]) -> tuple[list[dict], dict]:
-    """
-    Generate answers dynamically from each model using the real InferenceEngine.
-    """
-    outputs: list[dict] = []
-    runtime_registry = get_runtime_registry()
-    runtime_registry.register_models(models)
-    ordered_models = runtime_registry.order_models_for_request(models)
     
-    # Formulate real prompt with context
-    final_prompt = prompt
-    if context:
-        final_prompt = f"CONTEXT:\n{context}\n\nQUERY: {prompt}"
-        
-    for model in ordered_models:
-        query_id = uuid4()
-        model_output, runtime_state = runtime_registry.generate(
-            model_name=model,
-            prompt=final_prompt,
-            query_id=query_id,
-            prompt_hash=str(hash(final_prompt)),
-        )
-        
-        raw_answer = model_output.generated_answer
-        is_unavailable = runtime_state.status == MODEL_STATUS_UNAVAILABLE
-        is_probe_failed = runtime_state.status == MODEL_STATUS_PROBE_FAILED
+INFERENCE_MODE_SOLO = "solo"
+INFERENCE_MODE_PARTIAL = "partial_council"
+INFERENCE_MODE_FULL = "full_council"
 
-        support = None
-        risk = None
-        latency_ms = None
-        if runtime_state.status in {MODEL_STATUS_READY, MODEL_STATUS_READY_CPU}:
-            content_length = len(raw_answer.split())
-            if context and any(word in raw_answer.lower() for word in context.lower().split()[:20]):
-                support = min(0.95, 0.5 + (0.01 * content_length))
-            else:
-                support = min(0.6, 0.2 + (0.01 * content_length))
-            risk = max(0.01, 1.0 - support)
-            latency_ms = round(model_output.generation_latency_ms, 2)
+ROUTER_REASONING_TERMS = (
+    "tradeoff",
+    "reason",
+    "reasoning",
+    "step by step",
+    "architecture",
+    "design",
+    "debug",
+    "root cause",
+    "compare",
+    "optimize",
+    "prove",
+)
+ROUTER_RISK_TERMS = (
+    "security",
+    "privacy",
+    "compliance",
+    "legal",
+    "medical",
+    "finance",
+    "production",
+    "incident",
+    "vulnerability",
+    "prompt injection",
+    "safety",
+)
 
-        outputs.append({
-            "model": model,
-            "raw_answer": raw_answer,
-            "status": runtime_state.status,
-            "available": runtime_state.available,
-            "supported_claim_ratio": round(support, 2) if support is not None else None,
-            "risk_score": round(risk, 2) if risk is not None else None,
-            "latency_ms": latency_ms,
-            "runtime_device": runtime_state.runtime_device,
-            "quantization_mode": runtime_state.quantization_mode,
-            "resident": runtime_state.resident,
-            "error": raw_answer if (is_unavailable or is_probe_failed) else None,
-        })
 
-    ready_outputs = [
-        o
-        for o in outputs
-        if o.get("available") and o.get("status") in {MODEL_STATUS_READY, MODEL_STATUS_READY_CPU}
+@dataclass
+class ModelTelemetryState:
+    seat_id: str
+    role_title: str
+    model_id: str
+    status: str
+    parse_mode: str
+    raw_output_present: bool
+    recovered_output_used: bool
+    parse_error_type: Optional[str]
+    failure_is_hard: bool
+    usable_contribution: bool
+    usable_for_quorum: bool
+    latency_ms: Optional[float]
+    confidence: Optional[float]
+    grounding_confidence: Optional[float]
+    hallucination_risk: Optional[float]
+    uncertainty_signal: Optional[float]
+    alignment_with_final: Optional[float]
+    diagnostic_summary: str
+    failure_flags: list[str]
+
+
+@dataclass
+class DashboardRuntimeState:
+    inference_mode: str
+    selection_reason: str
+    escalated: bool
+    escalation_reason: str
+    active_models: list[str]
+    model_count: int
+    per_model: list[ModelTelemetryState]
+    agreement_summary: str
+    final_response_metadata: dict[str, Any]
+    degraded_quorum: bool
+    fallback_used: bool
+    total_latency_ms: Optional[float]
+    observability: dict[str, Any]
+    round_stats: list[dict[str, Any]]
+
+def _token_set(text: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", normalize_text(text).lower())
+        if len(token) > 2
+    }
+
+
+def _jaccard(text_a: str, text_b: str) -> Optional[float]:
+    tokens_a = _token_set(text_a)
+    tokens_b = _token_set(text_b)
+    if not tokens_a or not tokens_b:
+        return None
+    return round(len(tokens_a & tokens_b) / len(tokens_a | tokens_b), 2)
+
+
+def _total_latency_ms(trace: CouncilRunTrace) -> Optional[float]:
+    latencies = [
+        float(entry.result.latency_ms)
+        for entry in trace.transcript
+        if entry.result.latency_ms is not None
     ]
-    if not ready_outputs:
-        metrics_summary = {
-            "consensus_rate": None,
-            "dissent_severity": None,
-            "verdict": "FAIL",
-            "why": "No eligible models are currently available for live inference.",
-            "ready_model_count": 0,
-            "unavailable_model_count": len(outputs),
-        }
-    else:
-        avg_support = sum(o["supported_claim_ratio"] for o in ready_outputs) / len(ready_outputs)
-        metrics_summary = {
-            "consensus_rate": round(avg_support, 2),
-            "dissent_severity": round(1.0 - avg_support, 2),
-            "verdict": "ACCEPTED" if avg_support > 0.6 else "ESCALATE",
-            "why": (
-                f"Live evaluation computed {avg_support:.2f} average support across "
-                f"{len(ready_outputs)} ready model responses."
-            ),
-            "ready_model_count": len(ready_outputs),
-            "unavailable_model_count": len(outputs) - len(ready_outputs),
-        }
-        
-    return outputs, metrics_summary
+    if not latencies:
+        return None
+    return round(sum(latencies), 1)
 
-def governed_answer(prompt: str, council_outputs: list[dict], strict_grounding: bool) -> str:
-    """
-    Produce the final answer. In governance mode, enforce grounding rules.
-    """
-    return choose_council_answer(council_outputs, strict_grounding)
+
+def _mode_sequence(initial_mode: str) -> list[str]:
+    if initial_mode == INFERENCE_MODE_SOLO:
+        return [INFERENCE_MODE_SOLO, INFERENCE_MODE_PARTIAL, INFERENCE_MODE_FULL]
+    if initial_mode == INFERENCE_MODE_PARTIAL:
+        return [INFERENCE_MODE_PARTIAL, INFERENCE_MODE_FULL]
+    return [INFERENCE_MODE_FULL]
+
+
+def _select_initial_mode(prompt: str, route: dict[str, Any]) -> tuple[str, str]:
+    normalized = normalized_prompt(prompt)
+    token_count = len(normalized.split())
+    technical_hits = sum(1 for term in TECHNICAL_HINT_TERMS if term in normalized)
+    reasoning_hits = sum(1 for term in ROUTER_REASONING_TERMS if term in normalized)
+    risk_hits = sum(1 for term in ROUTER_RISK_TERMS if term in normalized)
+    ambiguity_hits = sum(
+        1
+        for term in ("maybe", "might", "unsure", "unclear", "it", "this", "that")
+        if term in normalized
+    )
+    code_presence = bool(
+        re.search(
+            r"```|`[^`]+`|\b(def|class|import|from|select|join|stack trace|traceback|exception)\b",
+            prompt,
+            flags=re.IGNORECASE,
+        )
+    )
+    retrieval_dependency = bool(route.get("needs_retrieval") or should_use_retrieval(prompt))
+    conversational = is_small_talk_prompt(prompt)
+
+    if (
+        conversational
+        and technical_hits == 0
+        and reasoning_hits == 0
+        and risk_hits == 0
+        and not retrieval_dependency
+    ):
+        return (
+            INFERENCE_MODE_SOLO,
+            "Low-risk conversational prompt; a single model is sufficient.",
+        )
+    if (
+        code_presence
+        or technical_hits >= 4
+        or reasoning_hits >= 3
+        or risk_hits >= 2
+        or (ambiguity_hits >= 2 and token_count >= 18)
+    ):
+        return (
+            INFERENCE_MODE_FULL,
+            "Complex or high-risk prompt detected; starting with full council for reliability.",
+        )
+    if (
+        technical_hits >= 2
+        or reasoning_hits >= 1
+        or ambiguity_hits >= 1
+        or retrieval_dependency
+        or risk_hits >= 1
+    ):
+        return (
+            INFERENCE_MODE_PARTIAL,
+            "Moderate complexity detected; starting with primary + challenger review.",
+        )
+    return (
+        INFERENCE_MODE_SOLO,
+        "Prompt appears straightforward; starting with single-model mode.",
+    )
+
+
+def _mode_config(
+    config: CouncilRuntimeConfig,
+    requested_mode: str,
+) -> tuple[CouncilRuntimeConfig, CouncilMode]:
+    if requested_mode == INFERENCE_MODE_FULL:
+        return config, CouncilMode.FULL_COUNCIL
+
+    seats = list(config.seats)
+    if not seats:
+        return config, CouncilMode.FAST_COUNCIL
+
+    primary = config.get_seat(config.chair_seat_id) or seats[0]
+    selected_ids = [primary.seat_id]
+
+    if requested_mode == INFERENCE_MODE_PARTIAL:
+        challenger = config.get_seat(config.backup_chair_seat_id)
+        if challenger is None or challenger.seat_id == primary.seat_id:
+            challenger = next(
+                (seat for seat in seats if seat.seat_id != primary.seat_id),
+                None,
+            )
+        if challenger is not None:
+            selected_ids.append(challenger.seat_id)
+
+    selected_set = set(selected_ids)
+    config.seats = [
+        seat.model_copy(update={"enabled_in_fast_mode": seat.seat_id in selected_set})
+        for seat in seats
+    ]
+    config.fast_quorum = max(1, len(selected_set))
+    if requested_mode == INFERENCE_MODE_SOLO:
+        config.escalation_disagreement_threshold = 1.0
+        config.escalation_confidence_threshold = 0.0
+    return config, CouncilMode.FAST_COUNCIL
+
+
+def _seat_status(
+    transcript_entries: list[Any],
+    parse_mode: str,
+    failure_is_hard: bool,
+    usable_for_quorum: bool,
+) -> str:
+    if not transcript_entries:
+        return "queued"
+    if failure_is_hard or parse_mode == "hard_failure":
+        return "failed"
+    if not usable_for_quorum:
+        return "failed"
+    if parse_mode == "repaired_json":
+        return "complete (repaired JSON)"
+    if parse_mode == "plain_text_fallback":
+        return "complete (text fallback)"
+    return "complete"
+
+
+def _model_summary(
+    *,
+    status: str,
+    parse_mode: str,
+    parse_error_type: Optional[str],
+    confidence: Optional[float],
+    grounding: Optional[float],
+    failure_flags: list[str],
+) -> str:
+    if status == "failed":
+        if parse_error_type:
+            return (
+                "Model failed and produced no usable output "
+                f"({parse_error_type})."
+            )
+        if failure_flags:
+            return f"Model failed due to {', '.join(failure_flags[:2])}."
+        return "Model failed to return a usable output."
+    if parse_mode == "repaired_json":
+        return "Model returned malformed JSON; recovered structured output via repair."
+    if parse_mode == "plain_text_fallback":
+        return (
+            "Model returned unstructured text; fallback answer used with reduced reliability."
+        )
+    if failure_flags:
+        return (
+            "Model completed with degraded signals: "
+            + ", ".join(failure_flags[:2])
+            + "."
+        )
+    if confidence is not None and grounding is not None:
+        return (
+            f"Model completed cleanly with confidence {confidence:.2f} "
+            f"and grounding {grounding:.2f}."
+        )
+    return "Model completed and contributed to synthesis."
+
+
+def _dashboard_state_from_trace(
+    trace: CouncilRunTrace,
+    *,
+    requested_mode: str,
+    selection_reason: str,
+    escalated: bool,
+    escalation_reason: str,
+) -> DashboardRuntimeState:
+    scorecards_by_seat = {card.seat_id: card for card in trace.scorecards}
+    initial_by_seat = {item.seat_id: item for item in trace.initial_answers}
+    revised_by_seat = {item.seat_id: item for item in trace.revised_answers}
+    failures_by_seat: dict[str, list[str]] = {}
+    for failure in trace.failures:
+        if not failure.seat_id:
+            continue
+        failures_by_seat.setdefault(failure.seat_id, []).append(failure.flag.value)
+    transcript_by_seat: dict[str, list[Any]] = {}
+    for entry in trace.transcript:
+        transcript_by_seat.setdefault(entry.seat_id, []).append(entry)
+
+    final_answer = (
+        trace.final_synthesis.final_answer if trace.final_synthesis is not None else ""
+    )
+    per_model: list[ModelTelemetryState] = []
+    for seat in trace.active_seats:
+        card = scorecards_by_seat.get(seat.seat_id)
+        seat_transcript = transcript_by_seat.get(seat.seat_id, [])
+        failure_flags = list(dict.fromkeys(failures_by_seat.get(seat.seat_id, [])))
+        initial_stage_entries = [
+            entry
+            for entry in seat_transcript
+            if getattr(entry.stage, "value", str(entry.stage)) == "initial_answer"
+        ]
+        initial_stage_entry = (
+            initial_stage_entries[-1]
+            if initial_stage_entries
+            else (seat_transcript[-1] if seat_transcript else None)
+        )
+        parse_mode = (
+            str(getattr(initial_stage_entry.result, "parse_mode", "clean_json"))
+            if initial_stage_entry is not None
+            else "hard_failure"
+        )
+        raw_output_present = bool(
+            getattr(initial_stage_entry.result, "raw_output_present", False)
+            if initial_stage_entry is not None
+            else False
+        )
+        recovered_output_used = bool(
+            getattr(initial_stage_entry.result, "recovered_output_used", False)
+            if initial_stage_entry is not None
+            else False
+        )
+        parse_error_type = (
+            getattr(initial_stage_entry.result, "parse_error_type", None)
+            if initial_stage_entry is not None
+            else "hard_failure"
+        )
+        failure_is_hard = bool(
+            getattr(initial_stage_entry.result, "failure_is_hard", False)
+            if initial_stage_entry is not None
+            else True
+        )
+        usable_contribution = bool(
+            getattr(initial_stage_entry.result, "usable_contribution", False)
+            if initial_stage_entry is not None
+            else (seat.seat_id in initial_by_seat)
+        )
+        usable_for_quorum = bool(
+            getattr(initial_stage_entry.result, "usable_for_quorum", usable_contribution)
+            if initial_stage_entry is not None
+            else (seat.seat_id in initial_by_seat)
+        )
+        status = _seat_status(
+            seat_transcript,
+            parse_mode,
+            failure_is_hard,
+            usable_for_quorum,
+        )
+
+        revised = revised_by_seat.get(seat.seat_id)
+        if revised is not None:
+            answer_text = revised.revised_answer
+        else:
+            initial = initial_by_seat.get(seat.seat_id)
+            answer_text = initial.answer if initial is not None else ""
+        alignment = _jaccard(answer_text, final_answer)
+
+        latency_values = [
+            float(entry.result.latency_ms)
+            for entry in seat_transcript
+            if entry.result.latency_ms is not None
+        ]
+        if card is not None and card.latency_ms is not None:
+            latency_ms = round(float(card.latency_ms), 1)
+        elif latency_values:
+            latency_ms = round(sum(latency_values), 1)
+        else:
+            latency_ms = None
+
+        confidence = float(card.confidence) if card is not None else None
+        grounding = float(card.grounding_confidence) if card is not None else None
+        uncertainty = None if confidence is None else round(1.0 - confidence, 2)
+        if confidence is not None and grounding is not None:
+            hallucination_risk = clamp(
+                (1.0 - grounding) * 0.6
+                + (1.0 - confidence) * 0.4
+                + (0.12 if "unsupported_claim" in failure_flags else 0.0)
+            )
+            hallucination_risk_value: Optional[float] = round(hallucination_risk, 2)
+        else:
+            hallucination_risk_value = None
+
+        per_model.append(
+            ModelTelemetryState(
+                seat_id=seat.seat_id,
+                role_title=seat.role_title,
+                model_id=seat.model_id,
+                status=status,
+                parse_mode=parse_mode,
+                raw_output_present=raw_output_present,
+                recovered_output_used=recovered_output_used,
+                parse_error_type=parse_error_type,
+                failure_is_hard=failure_is_hard,
+                usable_contribution=usable_contribution,
+                usable_for_quorum=usable_for_quorum,
+                latency_ms=latency_ms,
+                confidence=round(confidence, 2) if confidence is not None else None,
+                grounding_confidence=(
+                    round(grounding, 2) if grounding is not None else None
+                ),
+                hallucination_risk=hallucination_risk_value,
+                uncertainty_signal=uncertainty,
+                alignment_with_final=alignment,
+                diagnostic_summary=_model_summary(
+                    status=status,
+                    parse_mode=parse_mode,
+                    parse_error_type=parse_error_type,
+                    confidence=confidence,
+                    grounding=grounding,
+                    failure_flags=failure_flags,
+                ),
+                failure_flags=failure_flags,
+            )
+        )
+
+    effective_mode = trace.observability.effective_mode.value
+    if effective_mode == CouncilMode.FULL_COUNCIL.value:
+        inference_mode = INFERENCE_MODE_FULL
+    elif len(per_model) <= 1:
+        inference_mode = INFERENCE_MODE_SOLO
+    elif len(per_model) == 2:
+        inference_mode = INFERENCE_MODE_PARTIAL
+    else:
+        inference_mode = INFERENCE_MODE_PARTIAL
+
+    fallback_used = (
+        bool(trace.final_synthesis.fallback_used)
+        if trace.final_synthesis is not None
+        else True
+    )
+    usable_contributor_count = sum(
+        1
+        for model in per_model
+        if model.usable_for_quorum and not model.failure_is_hard
+    )
+    agreement_available = (
+        inference_mode != INFERENCE_MODE_SOLO and usable_contributor_count >= 2
+    )
+    degraded_quorum = not trace.quorum_success
+    total_latency = _total_latency_ms(trace)
+    winners = (
+        trace.final_synthesis.winner_seat_ids if trace.final_synthesis is not None else []
+    )
+    winner_text = ", ".join(winners) if winners else "none"
+
+    if inference_mode == INFERENCE_MODE_SOLO:
+        agreement_summary = (
+            "Solo run used one model; no peer agreement check was required."
+        )
+    elif not agreement_available:
+        agreement_summary = (
+            "Insufficient participating models for meaningful agreement analysis."
+        )
+    elif inference_mode == INFERENCE_MODE_PARTIAL:
+        agreement_summary = (
+            f"Partial council compared {len(per_model)} models; disagreement "
+            f"{trace.disagreement_score:.2f}, confidence {trace.council_confidence:.2f}, "
+            f"winner(s): {winner_text}."
+        )
+    else:
+        agreement_summary = (
+            f"Full council ran {len(per_model)} models; disagreement "
+            f"{trace.disagreement_score:.2f}, confidence {trace.council_confidence:.2f}, "
+            f"winner(s): {winner_text}."
+        )
+
+    final_response_metadata = {
+        "final_answer": final_answer,
+        "contract_version": trace.contract_version,
+        "requested_mode": requested_mode,
+        "effective_mode": effective_mode,
+        "disagreement_score": (
+            round(float(trace.disagreement_score), 2) if agreement_available else None
+        ),
+        "agreement_available": agreement_available,
+        "council_confidence": round(float(trace.council_confidence), 2),
+        "quorum_success": bool(trace.quorum_success),
+        "usable_contributor_count": usable_contributor_count,
+        "failure_count": len(trace.failures),
+        "failure_flags": sorted({failure.flag.value for failure in trace.failures}),
+        "latency_ms": total_latency,
+    }
+
+    return DashboardRuntimeState(
+        inference_mode=inference_mode,
+        selection_reason=selection_reason,
+        escalated=escalated or trace.escalated_to_full,
+        escalation_reason=escalation_reason or (trace.observability.escalation_reason or ""),
+        active_models=[model.model_id for model in per_model],
+        model_count=len(per_model),
+        per_model=per_model,
+        agreement_summary=agreement_summary,
+        final_response_metadata=final_response_metadata,
+        degraded_quorum=degraded_quorum,
+        fallback_used=fallback_used,
+        total_latency_ms=total_latency,
+        observability={
+            "cache_status": trace.observability.cache_status.value,
+            "quorum_success": trace.observability.quorum_success,
+            "chair_selected_seat_id": trace.observability.chair_selected_seat_id,
+            "chair_selected_model_id": trace.observability.chair_selected_model_id,
+            "active_seat_ids": list(trace.observability.active_seat_ids),
+            "active_model_ids": list(trace.observability.active_model_ids),
+        },
+        round_stats=[
+            {
+                "stage": item.stage.value,
+                "attempted": item.attempted,
+                "succeeded": item.succeeded,
+                "failed": item.failed,
+            }
+            for item in trace.observability.round_stats
+        ],
+    )
+
+
+def _quality_gate(
+    trace: CouncilRunTrace,
+    requested_mode: str,
+    state: DashboardRuntimeState,
+) -> tuple[bool, str]:
+    final_answer = str(state.final_response_metadata.get("final_answer", "")).strip()
+    if not final_answer:
+        return False, "No reliable final answer was produced."
+    if requested_mode == INFERENCE_MODE_FULL:
+        return True, ""
+
+    confidence_floor = 0.64 if requested_mode == INFERENCE_MODE_SOLO else 0.58
+    disagreement_ceiling = 0.32 if requested_mode == INFERENCE_MODE_SOLO else 0.52
+    severe_failures = {
+        FailureFlag.TIMEOUT.value,
+        FailureFlag.UNAVAILABLE_MODEL.value,
+        FailureFlag.SYNTHESIS_FAILURE.value,
+        FailureFlag.RUNTIME_ERROR.value,
+    }
+    severe_count = sum(
+        1 for failure in trace.failures if failure.flag.value in severe_failures
+    )
+
+    if not trace.quorum_success:
+        return False, "Quorum was not met for the requested mode."
+    if state.fallback_used:
+        return False, "Fallback synthesis was used; escalating for a stronger answer."
+    if float(trace.council_confidence) < confidence_floor:
+        return (
+            False,
+            f"Council confidence {trace.council_confidence:.2f} below threshold {confidence_floor:.2f}.",
+        )
+    if float(trace.disagreement_score) > disagreement_ceiling:
+        return (
+            False,
+            f"Disagreement {trace.disagreement_score:.2f} exceeded threshold {disagreement_ceiling:.2f}.",
+        )
+    if severe_count > 0:
+        return False, f"Detected {severe_count} severe runtime failure(s)."
+    return True, ""
+
+
+def _run_single_mode(prompt: str, requested_mode: str) -> CouncilRunTrace:
+    config = load_runtime_config()
+    config, runtime_mode = _mode_config(config, requested_mode)
+    runtime = CouncilRuntime(config=config)
+    request = CouncilRequest(
+        query=prompt,
+        mode=runtime_mode,
+        enable_revision_round=config.enable_revision_round,
+        demo_mode=False,
+        force_live_rerun=True,
+    )
+    return runtime.run(request)
+
+
+def run_adaptive_council(
+    prompt: str,
+    route: dict[str, Any],
+) -> tuple[DashboardRuntimeState, CouncilRunTrace]:
+    initial_mode, selection_reason = _select_initial_mode(prompt, route)
+    sequence = _mode_sequence(initial_mode)
+    escalation_notes: list[str] = []
+    escalated = False
+
+    latest_state: Optional[DashboardRuntimeState] = None
+    latest_trace: Optional[CouncilRunTrace] = None
+    for index, requested_mode in enumerate(sequence):
+        trace = _run_single_mode(prompt, requested_mode)
+        latest_state = _dashboard_state_from_trace(
+            trace,
+            requested_mode=requested_mode,
+            selection_reason=selection_reason,
+            escalated=escalated,
+            escalation_reason="; ".join(escalation_notes),
+        )
+        latest_trace = trace
+        sufficient, escalation_reason = _quality_gate(trace, requested_mode, latest_state)
+        if (
+            sufficient
+            or latest_state.inference_mode == INFERENCE_MODE_FULL
+            or index == len(sequence) - 1
+        ):
+            if escalation_reason and latest_state.inference_mode == INFERENCE_MODE_FULL:
+                if latest_state.escalation_reason:
+                    latest_state.escalation_reason = (
+                        latest_state.escalation_reason + "; " + escalation_reason
+                    )
+                else:
+                    latest_state.escalation_reason = escalation_reason
+            return latest_state, latest_trace
+        escalated = True
+        escalation_notes.append(escalation_reason)
+
+    if latest_state is None or latest_trace is None:
+        raise RuntimeError(
+            "Adaptive council execution failed before producing a runtime trace."
+        )
+    return latest_state, latest_trace
 
 def execute_council_turn(
     prompt: str,
@@ -1172,32 +1679,60 @@ def execute_council_turn(
     attach_context: bool,
     history_key: str = "chat_history",
 ):
-    # Intent tracking without blocking via mock answers
+    _ = (selected_models, mode, scenario_name, temperature, max_tokens, attach_context)
     route = llm_route(prompt)
-    strict_grounding = route.get("strict_grounding", False) or (mode == "Governance (Strict)")
-    
-    # Context handling
-    context = ""
-    if route.get("needs_retrieval", False):
-        scenario = SCENARIO_PACKS.get(scenario_name, SCENARIO_PACKS["clean retrieval"])
-        context = " ".join(scenario["documents"])
-    
-    # ALL traffic goes through live council evaluation now
-    council_outputs, council_metrics = run_council(prompt, context, selected_models)
-    final_answer = governed_answer(prompt, council_outputs, strict_grounding)
-    
+    runtime_state, trace = run_adaptive_council(prompt, route)
+    final_answer = str(runtime_state.final_response_metadata.get("final_answer", "")).strip()
+    if not final_answer:
+        final_answer = FALLBACK_TEXT
+
+    per_model_payload = [
+        {
+            "seat_id": model.seat_id,
+            "model": model.model_id,
+            "status": model.status,
+            "latency_ms": model.latency_ms,
+            "confidence": model.confidence,
+            "grounding_confidence": model.grounding_confidence,
+            "hallucination_risk": model.hallucination_risk,
+            "alignment_with_final": model.alignment_with_final,
+            "summary": model.diagnostic_summary,
+            "failure_flags": list(model.failure_flags),
+        }
+        for model in runtime_state.per_model
+    ]
+    verdict = "PASS"
+    if runtime_state.degraded_quorum:
+        verdict = "DEGRADED"
+    if not runtime_state.final_response_metadata.get("quorum_success"):
+        verdict = "ESCALATE"
+
     turn = {
         "prompt_id": uuid4().hex,
         "timestamp": datetime.utcnow().isoformat(),
         "prompt": prompt,
         "final_answer": final_answer,
-        "per_model": council_outputs,
-        "metrics": council_metrics,
+        "mode_used": runtime_state.inference_mode,
+        "per_model": per_model_payload,
+        "metrics": {
+            "verdict": verdict,
+            "model_count": runtime_state.model_count,
+            "latency_ms": runtime_state.total_latency_ms,
+            "council_confidence": runtime_state.final_response_metadata.get("council_confidence"),
+            "disagreement_score": runtime_state.final_response_metadata.get("disagreement_score"),
+            "why": runtime_state.selection_reason,
+        },
+        "council": {
+            "verdict": verdict,
+            "agreement_summary": runtime_state.agreement_summary,
+            "contract_version": runtime_state.final_response_metadata.get("contract_version"),
+        },
         "route": route,
-        "is_fast_path": False
+        "runtime_state": asdict(runtime_state),
+        "runtime_trace": trace.model_dump(mode="json"),
+        "is_fast_path": runtime_state.inference_mode == INFERENCE_MODE_SOLO and not runtime_state.escalated,
     }
 
-    # Persist and update state
     st.session_state.setdefault(history_key, [])
     st.session_state[history_key].append(turn)
     st.session_state["council_chat"] = st.session_state.get("chat_history", [])
@@ -1218,95 +1753,130 @@ def challenge_prompt(action: str, model_name: str, turn: dict) -> str:
     return f"{base}\n\nAsk {model_name} to rate its confidence and explain uncertainty."
 
 
-def render_model_health(selected_models: list[str], history_key: str):
-    st.subheader("Council Model Health")
+def render_turn_runtime_metadata(turn: dict[str, Any]) -> None:
+    runtime_state = turn.get("runtime_state", {})
+    if not isinstance(runtime_state, dict):
+        return
+
+    mode = runtime_state.get("inference_mode", "unknown")
+    escalated = bool(runtime_state.get("escalated", False))
+    degraded_quorum = bool(runtime_state.get("degraded_quorum", False))
+    fallback_used = bool(runtime_state.get("fallback_used", False))
+    selection_reason = runtime_state.get("selection_reason", "")
+    escalation_reason = runtime_state.get("escalation_reason", "")
+    model_count = runtime_state.get("model_count", 0)
+    latency_ms = runtime_state.get("total_latency_ms")
+    latency_label = f"{latency_ms} ms" if latency_ms is not None else "N/A"
+
+    st.caption(
+        f"Mode: `{mode}` | Escalated: `{str(escalated).lower()}` | "
+        f"Models: `{model_count}` | Latency: `{latency_label}`"
+    )
+    if selection_reason:
+        st.caption(f"Selection reason: {selection_reason}")
+    if escalated and escalation_reason:
+        st.caption(f"Escalation reason: {escalation_reason}")
+    if degraded_quorum:
+        st.caption("Runtime note: quorum was degraded; output used partial council participation.")
+    elif fallback_used:
+        st.caption("Runtime note: fallback synthesis path was used to produce the final response.")
+
+
+def render_live_model_performance(history_key: str):
+    st.subheader("Live Model Performance")
+    st.caption(
+        "Telemetry reflects the latest query trace. Status and diagnostics are derived from the live council runtime contract."
+    )
     turns = st.session_state.get(history_key, [])
-    runtime_registry = get_runtime_registry()
-    runtime_registry.register_models(selected_models)
+    if not turns:
+        st.info("No model activity yet. Submit a query in Query Playground.")
+        return
 
-    rows = []
-    for model_name in selected_models:
-        entries = []
-        for turn in turns:
-            for item in turn.get("per_model", []):
-                if item.get("model") == model_name:
-                    entries.append(item)
-        runtime_state = runtime_registry.get_state(model_name)
-        rows.append(summarize_model_health(model_name, entries, runtime_state))
+    latest_turn = turns[-1]
+    runtime_state = latest_turn.get("runtime_state", {})
+    if not isinstance(runtime_state, dict):
+        st.warning("No runtime telemetry found for the latest turn.")
+        return
 
-    if rows and all(row["status"] == MODEL_STATUS_PROBE_FAILED for row in rows):
-        st.error(
-            "Runtime probe layer failure: all selected models are currently in PROBE_FAILED state. "
-            "Live health metrics are unavailable until probing recovers."
+    mode = runtime_state.get("inference_mode", INFERENCE_MODE_SOLO)
+    cards = runtime_state.get("per_model", [])
+    if not cards:
+        st.warning("No per-model telemetry was emitted for this query.")
+        return
+
+    if runtime_state.get("degraded_quorum", False):
+        st.warning(
+            "Council completed in a degraded state. Some seats failed to provide quorum-usable outputs."
+        )
+    elif runtime_state.get("fallback_used", False):
+        st.info("Fallback synthesis path was used to complete this answer safely.")
+
+    columns = st.columns(max(1, len(cards)))
+    for idx, card in enumerate(cards):
+        with columns[idx]:
+            st.markdown(f"**{card.get('model_id', 'unknown')}**")
+            st.caption(card.get("role_title", ""))
+            status_value = str(card.get("status", "unknown"))
+            parse_mode = str(card.get("parse_mode", ""))
+            if status_value == "complete":
+                if parse_mode == "repaired_json":
+                    status_value = "complete (repaired JSON)"
+                elif parse_mode == "plain_text_fallback":
+                    status_value = "complete (text fallback)"
+            st.metric("Status", status_value)
+            latency_value = card.get("latency_ms")
+            st.metric("Latency", f"{latency_value} ms" if latency_value is not None else "N/A")
+            confidence = card.get("confidence")
+            st.metric("Confidence", f"{confidence:.2f}" if confidence is not None else "N/A")
+            grounding = card.get("grounding_confidence")
+            st.metric("Grounding", f"{grounding:.2f}" if grounding is not None else "N/A")
+            risk = card.get("hallucination_risk")
+            st.metric("Hallucination Risk", f"{risk:.2f}" if risk is not None else "N/A")
+            alignment = card.get("alignment_with_final")
+            st.metric("Alignment", f"{alignment:.2f}" if alignment is not None else "N/A")
+            st.caption(card.get("diagnostic_summary", ""))
+            flags = card.get("failure_flags", [])
+            if flags:
+                st.caption("Flags: " + ", ".join(flags))
+
+    if mode == INFERENCE_MODE_PARTIAL and len(cards) >= 2:
+        first = cards[0]
+        second = cards[1]
+        st.markdown("**Comparison Summary**")
+        st.caption(
+            f"Primary/challenger comparison: {first.get('model_id', 'model_a')} vs {second.get('model_id', 'model_b')}."
+        )
+        st.info(runtime_state.get("agreement_summary", ""))
+    elif mode == INFERENCE_MODE_FULL:
+        st.markdown("**Agreement / Disagreement Summary**")
+        st.info(runtime_state.get("agreement_summary", ""))
+    else:
+        st.markdown("**Solo Summary**")
+        st.caption(
+            "Solo mode keeps cost and latency low for straightforward prompts while preserving escalation when needed."
         )
 
-    if not turns and all(
-        row["status"] in {MODEL_STATUS_NOT_MEASURED, MODEL_STATUS_REGISTERED}
-        for row in rows
-    ):
-        st.info("No council activity yet. Submit a prompt to populate live model health.")
+    metadata = runtime_state.get("final_response_metadata", {})
+    failure_count = metadata.get("failure_count")
+    if failure_count:
+        failure_flags = metadata.get("failure_flags", [])
+        st.caption(
+            f"Runtime recorded {failure_count} failure event(s): "
+            + (", ".join(failure_flags) if failure_flags else "unspecified")
+        )
 
-    cols = st.columns(len(selected_models))
-    for idx, row in enumerate(rows):
-        with cols[idx]:
-            st.markdown(f"**{row['model']}**")
-            st.metric("Health", f"{row['health']}%" if row["health"] is not None else "N/A")
-            st.metric("Status", row["status"])
-            st.metric("Latency", f"{row['avg_latency_ms']} ms" if row["avg_latency_ms"] is not None else "N/A")
-            st.metric("Support", f"{row['avg_support']:.2f}" if row["avg_support"] is not None else "N/A")
-            st.metric("Risk", f"{row['avg_risk']:.2f}" if row["avg_risk"] is not None else "N/A")
-            st.caption(f"Policy flags: {row['policy_flags']}")
-            st.caption(
-                f"Fallback rate: {row['fallback_rate']:.0%}"
-                if row["fallback_rate"] is not None
-                else "Fallback rate: N/A"
-            )
-            runtime_caption = f"Backend: {row['backend']}"
-            if row.get("runtime_device"):
-                runtime_caption += f" | Device: {row['runtime_device']}"
-            if row.get("quantization_mode"):
-                runtime_caption += f" | Quant: {row['quantization_mode']}"
-            if row.get("resident") is not None:
-                runtime_caption += f" | Resident: {'yes' if row['resident'] else 'no'}"
-            st.caption(runtime_caption)
-            if row.get("last_probe_result"):
-                st.caption(f"Probe: {row['last_probe_result']}")
-            if row.get("error"):
-                st.caption(f"Runtime: {row['error'][:140]}")
-
-    health_df = pd.DataFrame(rows).sort_values(
-        by="health", ascending=False, na_position="last"
-    )
-    st.dataframe(
-        health_df.rename(
-            columns={
-                "model": "Model",
-                "health": "Health %",
-                "status": "Status",
-                "avg_latency_ms": "Avg Latency (ms)",
-                "avg_support": "Avg Support",
-                "avg_risk": "Avg Risk",
-                "policy_flags": "Policy Flags",
-                "fallback_rate": "Fallback Rate",
-                "backend": "Backend",
-                "runtime_device": "Device",
-                "quantization_mode": "Quantization",
-                "resident": "Resident",
-                "last_probe_result": "Probe Result",
-            }
-        ),
-        hide_index=True,
-        use_container_width=True,
-    )
+    round_stats = runtime_state.get("round_stats", [])
+    if round_stats:
+        st.markdown("**Round Stats**")
+        st.caption("Attempt/success/failure counts per stage for this query.")
+        st.dataframe(pd.DataFrame(round_stats), hide_index=True, use_container_width=True)
 
 
 def render_council_chat(df: pd.DataFrame | None):
     init_council_state()
 
-    # User-facing defaults (internal controls hidden)
     selected_models = DEFAULT_MODELS
-    get_runtime_registry().register_models(selected_models)
-    mode = "Governed Output"
+    mode = "adaptive"
     scenario_name = "clean retrieval"
     temperature = 0.2
     max_tokens = 128
@@ -1320,10 +1890,12 @@ def render_council_chat(df: pd.DataFrame | None):
     history_key = history_key_for_mode(benchmark_mode)
     turns = get_history_store(benchmark_mode)
 
-    st.title("RAG Assistant")
-    st.caption("Ask a question and get a direct answer.")
+    st.title("LLM Council Query Playground")
+    st.caption(
+        "Ask naturally. The system auto-selects solo, partial council, or full council based on query complexity and risk."
+    )
 
-    tab_chat, tab_health = st.tabs(["Chat", "Model Health"])
+    tab_chat, tab_health = st.tabs(["Query Playground", "Live Model Performance"])
 
     with tab_chat:
         chat_container = st.container()
@@ -1339,6 +1911,7 @@ def render_council_chat(df: pd.DataFrame | None):
                     with st.chat_message("assistant"):
                         answer = turn.get("final_answer") or turn.get("governed_answer") or turn.get("council_answer", "")
                         st.markdown(f"<div class='synthesis-box'>{answer}</div>", unsafe_allow_html=True)
+                        render_turn_runtime_metadata(turn)
 
         prompt = st.chat_input("Ask anything...")
         if prompt:
@@ -1356,7 +1929,7 @@ def render_council_chat(df: pd.DataFrame | None):
             st.rerun()
 
     with tab_health:
-        render_model_health(selected_models, history_key)
+        render_live_model_performance(history_key)
 # --- Sidebar ---
 ds_path = output_dir / "evaluation_dataset.jsonl"
 df = load_dataset(ds_path)

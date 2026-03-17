@@ -1,0 +1,54 @@
+{
+  "prompts": [
+    {
+      "id": "system_design_secure_rag",
+      "category": "system_design",
+      "query": "Design a secure production RAG architecture for regulated data with clear control-plane and data-plane boundaries."
+    },
+    {
+      "id": "debug_vector_recall",
+      "category": "coding_debugging",
+      "query": "My retrieval recall dropped after switching embedding models. Give a concrete debugging checklist with likely root causes."
+    },
+    {
+      "id": "ambiguous_fact",
+      "category": "ambiguous_factual",
+      "query": "What is the best LLM for enterprise reliability right now?"
+    },
+    {
+      "id": "safety_compliance",
+      "category": "safety_compliance",
+      "query": "What governance checks should block release of an internal assistant handling HR and finance documents?"
+    },
+    {
+      "id": "disagreement_trigger",
+      "category": "likely_disagreement",
+      "query": "Should we optimize council latency by removing critique rounds entirely, or keep critique rounds for reliability?"
+    },
+    {
+      "id": "low_confidence_trigger",
+      "category": "likely_low_confidence",
+      "query": "How should we guarantee zero hallucinations in a general-purpose assistant with unknown domains?"
+    },
+    {
+      "id": "concise_question",
+      "category": "concise",
+      "query": "Fastest safe rollback strategy?"
+    },
+    {
+      "id": "multi_step_reasoning",
+      "category": "multi_step",
+      "query": "Create a step-by-step rollout plan for adding a new model seat to the council with canarying, evaluation gates, and rollback."
+    },
+    {
+      "id": "high_hallucination_risk",
+      "category": "hallucination_risk",
+      "query": "Provide exact legal obligations for deploying LLM assistants in every U.S. state, with specific citations."
+    },
+    {
+      "id": "cautious_uncertainty",
+      "category": "uncertainty_expected",
+      "query": "Predict how model provider API pricing will change over the next 18 months and recommend firm budget allocations."
+    }
+  ]
+}

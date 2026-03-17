@@ -1,0 +1,29 @@
+{
+  "chair_seat_id": "llama-3-8b",
+  "backup_chair_seat_id": "phi-3-mini",
+  "use_real_models": false,
+  "hf_router_base_url": "https://router.huggingface.co/v1",
+  "fast_seat_ids": [
+    "llama-3-8b",
+    "phi-3-mini",
+    "qwen-2-7b"
+  ],
+  "enable_revision_round": true,
+  "cache_path": "./output/council_transcript_cache.json",
+  "escalation_disagreement_threshold": 0.45,
+  "escalation_confidence_threshold": 0.55,
+  "model_ids": {
+    "llama-3-8b": "meta-llama/Meta-Llama-3-8B-Instruct",
+    "gemma-7b": "google/gemma-1.1-7b-it",
+    "mistral-7b-v0.3": "mistralai/Mistral-7B-Instruct-v0.3",
+    "phi-3-mini": "microsoft/Phi-3-mini-4k-instruct",
+    "qwen-2-7b": "Qwen/Qwen2-7B-Instruct"
+  },
+  "featured_prompts": [
+    "Give an architecture recommendation for a secure RAG system in production.",
+    "How should we detect and contain prompt-injection in retrieval context?",
+    "Design a latency budget strategy for multi-model council chat under 8 seconds.",
+    "What governance checks should block release of a new LLM assistant?",
+    "How should we evaluate answer quality when retrieval evidence is conflicting?"
+  ]
+}

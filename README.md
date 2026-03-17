@@ -85,6 +85,88 @@ python -m rlrgf --experiment-id exp_001 --output-dir ./output
 python -m rlrgf --experiment-id exp_001 --load-model --model-name microsoft/phi-2
 ```
 
+### 3b. Run Live Council Runtime (No Dashboard)
+
+```bash
+cd python
+.venv\Scripts\activate
+
+# Fast mode council run
+python -m rlrgf.run_council_runtime --query "How should we secure a production RAG stack?" --mode fast
+
+# Full trace JSON for debugging/integration
+python -m rlrgf.run_council_runtime --query "How should we secure a production RAG stack?" --mode full --json
+
+# Force real Hugging Face router calls
+# Place Hugging Face token in:
+# E:\MLOps\LLM Failure Evaluation Engine\python\rlrgf\hf_token.txt
+cd rlrgf
+python run_council_runtime.py "Explain exponential backoff" --use-real-models
+```
+
+Runtime endpoint settings can be provided with:
+
+- `COUNCIL_API_BASE_URL`
+- `COUNCIL_API_KEY`
+- `COUNCIL_MODEL_<SEAT_ID>` for per-seat model overrides (example: `COUNCIL_MODEL_LLAMA_3_8B`)
+- `HF_TOKEN` (used as fallback only when `E:\MLOps\LLM Failure Evaluation Engine\python\rlrgf\hf_token.txt` is missing)
+- `COUNCIL_USE_REAL_MODELS` (`true`/`false` switch)
+
+Adapter behavior:
+
+- default/offline path uses `MockCouncilInferenceAdapter`
+- real path uses `HuggingFaceRouterInferenceAdapter` against `https://router.huggingface.co/v1`
+- CLI prints selected adapter, `remote_requests`, token-found status, token source, and base URL (never token value)
+
+Smoke harness:
+
+```bash
+cd python
+.venv\Scripts\activate
+
+python -m rlrgf.run_council_runtime_smoke --modes fast,full --prompt-pack ..\config\council_smoke_prompts.json
+
+# Optional: force real router calls for smoke runs
+python -m rlrgf.run_council_runtime_smoke --modes fast,full --prompt-pack ..\config\council_smoke_prompts.json --use-real-models
+```
+
+## Council Runtime Contract (Frozen Pre-Dashboard)
+
+The live runtime now emits a stable typed trace contract (`contract_version: council_runtime_v1`) with:
+
+- request envelope (`CouncilRequest`)
+- per-round artifacts (`initial_answers`, `peer_critiques`, `revised_answers`, `final_synthesis`)
+- per-seat scorecards (`ModelScoreCard`)
+- normalized failure events (`FailureEvent`)
+- typed transcript events (`TranscriptEntry`)
+- observability block (`requested/effective mode`, `active models`, `escalation`, `chair`, `fallback`, `cache status`, `quorum`, `round stats`)
+
+Key reliability guarantees:
+
+- malformed JSON and empty responses are normalized to explicit failure flags
+- synthesis retries backup chair before final fallback
+- duplicate failure events are deduplicated
+- scorecard build failures degrade gracefully into valid fallback scorecards
+- cache entries are schema-versioned to avoid stale contract reuse
+- `force_live_rerun` bypasses cache reads
+
+## Pre-Dashboard Status
+
+Handled failure/degradation cases include:
+
+- one-model timeout with surviving quorum
+- multiple fast-mode failures with controlled escalation
+- partial critique/revision failures
+- synthesis failure with fallback
+- malformed/empty outputs across rounds
+- unavailable models during escalation
+
+Still intentionally pending before UI wiring:
+
+- dashboard integration onto this runtime contract
+- UI mapping for observability/round stats surfaces
+- UX decisions for degraded quorum and fallback messaging
+
 ### 4. Start Rust API Server
 
 ```bash
