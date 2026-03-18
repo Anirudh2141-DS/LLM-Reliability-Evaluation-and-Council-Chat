@@ -20,6 +20,11 @@ class CouncilMode(str, Enum):
     FAST_COUNCIL = "fast_council"
 
 
+class ExecutionMode(str, Enum):
+    INTERACTIVE = "interactive"
+    BENCHMARK = "benchmark"
+
+
 class AvailabilityStatus(str, Enum):
     READY = "ready"
     DEGRADED = "degraded"
@@ -58,6 +63,7 @@ class CouncilRequest(BaseModel):
     request_id: UUID = Field(default_factory=uuid4)
     query: str
     mode: CouncilMode = CouncilMode.FAST_COUNCIL
+    execution_mode: ExecutionMode = ExecutionMode.BENCHMARK
     enable_revision_round: bool = True
     demo_mode: bool = True
     force_live_rerun: bool = False
@@ -325,10 +331,18 @@ class TranscriptEntry(BaseModel):
 class RuntimeObservability(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    execution_mode: ExecutionMode = ExecutionMode.BENCHMARK
     requested_mode: CouncilMode = CouncilMode.FAST_COUNCIL
     effective_mode: CouncilMode = CouncilMode.FAST_COUNCIL
     active_seat_ids: list[str] = Field(default_factory=list)
     active_model_ids: list[str] = Field(default_factory=list)
+    number_of_models_requested: int = Field(default=0, ge=0)
+    number_of_models_succeeded: int = Field(default=0, ge=0)
+    number_of_models_failed: int = Field(default=0, ge=0)
+    critique_enabled: bool = False
+    backend_type: str = "mock"
+    total_latency_ms: float = Field(default=0.0, ge=0.0)
+    per_model_latency_ms: dict[str, float] = Field(default_factory=dict)
     escalation_triggered: bool = False
     escalation_reason: Optional[str] = None
     chair_selected_seat_id: Optional[str] = None

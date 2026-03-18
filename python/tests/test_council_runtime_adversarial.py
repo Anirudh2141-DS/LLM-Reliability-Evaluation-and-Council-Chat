@@ -144,6 +144,7 @@ def _runtime_config(cache_path: Path) -> CouncilRuntimeConfig:
         model_timeout_s=5.0,
         fast_quorum=2,
         full_quorum=3,
+        benchmark_enable_pairwise_critique=True,
         escalation_disagreement_threshold=0.45,
         escalation_confidence_threshold=0.55,
         chair_seat_id="seat-a",

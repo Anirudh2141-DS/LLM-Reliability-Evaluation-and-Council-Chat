@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from .council_runtime_schemas import CouncilMode, CouncilSeat
+from .council_runtime_schemas import CouncilMode, CouncilSeat, ExecutionMode
 
 
 DEFAULT_COUNCIL_CONFIG_PATH = Path("config/council_models.json")
@@ -146,6 +146,7 @@ class CouncilRuntimeConfig:
     hf_token_source: str = "none"
     hf_token_path: str = str(HF_TOKEN_FILE_PATH)
     use_real_models: bool = False
+    default_execution_mode: ExecutionMode = ExecutionMode.BENCHMARK
     hf_router_base_url: str = "https://router.huggingface.co/v1"
     request_timeout_s: float = 45.0
     model_timeout_s: float = 30.0
@@ -157,6 +158,13 @@ class CouncilRuntimeConfig:
     fast_quorum: int = 2
     full_quorum: int = 3
     enable_revision_round: bool = True
+    benchmark_enable_pairwise_critique: bool = False
+    benchmark_enable_summary_review: bool = True
+    interactive_max_models: int = 2
+    interactive_enable_secondary_review: bool = False
+    interactive_prefer_remote: bool = True
+    interactive_disable_cpu_fallback: bool = True
+    interactive_skip_heavy_probe: bool = True
     chair_seat_id: str = "llama-3-8b"
     backup_chair_seat_id: str = "phi-3-mini"
     cache_path: str = "./output/council_transcript_cache.json"
@@ -229,6 +237,54 @@ def load_runtime_config(config_path: Optional[str] = None) -> CouncilRuntimeConf
     cfg.enable_revision_round = _coerce_bool(
         raw.get("enable_revision_round", cfg.enable_revision_round),
         cfg.enable_revision_round,
+    )
+    raw_execution_mode = str(
+        raw.get("default_execution_mode", cfg.default_execution_mode.value)
+    ).strip().lower()
+    if raw_execution_mode == ExecutionMode.INTERACTIVE.value:
+        cfg.default_execution_mode = ExecutionMode.INTERACTIVE
+    else:
+        cfg.default_execution_mode = ExecutionMode.BENCHMARK
+    cfg.benchmark_enable_pairwise_critique = _coerce_bool(
+        raw.get(
+            "benchmark_enable_pairwise_critique",
+            cfg.benchmark_enable_pairwise_critique,
+        ),
+        cfg.benchmark_enable_pairwise_critique,
+    )
+    cfg.benchmark_enable_summary_review = _coerce_bool(
+        raw.get(
+            "benchmark_enable_summary_review",
+            cfg.benchmark_enable_summary_review,
+        ),
+        cfg.benchmark_enable_summary_review,
+    )
+    cfg.interactive_max_models = _coerce_int(
+        raw.get("interactive_max_models", cfg.interactive_max_models),
+        cfg.interactive_max_models,
+        minimum=1,
+    )
+    cfg.interactive_enable_secondary_review = _coerce_bool(
+        raw.get(
+            "interactive_enable_secondary_review",
+            cfg.interactive_enable_secondary_review,
+        ),
+        cfg.interactive_enable_secondary_review,
+    )
+    cfg.interactive_prefer_remote = _coerce_bool(
+        raw.get("interactive_prefer_remote", cfg.interactive_prefer_remote),
+        cfg.interactive_prefer_remote,
+    )
+    cfg.interactive_disable_cpu_fallback = _coerce_bool(
+        raw.get(
+            "interactive_disable_cpu_fallback",
+            cfg.interactive_disable_cpu_fallback,
+        ),
+        cfg.interactive_disable_cpu_fallback,
+    )
+    cfg.interactive_skip_heavy_probe = _coerce_bool(
+        raw.get("interactive_skip_heavy_probe", cfg.interactive_skip_heavy_probe),
+        cfg.interactive_skip_heavy_probe,
     )
     cfg.cache_path = str(raw.get("cache_path", cfg.cache_path))
     cfg.hf_router_base_url = str(raw.get("hf_router_base_url", cfg.hf_router_base_url))
@@ -315,6 +371,12 @@ def load_runtime_config(config_path: Optional[str] = None) -> CouncilRuntimeConf
         cfg.use_real_models = True
     if cfg.use_real_models and not cfg.base_url:
         cfg.base_url = cfg.hf_router_base_url
+
+    env_execution_mode = os.getenv("COUNCIL_EXECUTION_MODE", "").strip().lower()
+    if env_execution_mode == ExecutionMode.INTERACTIVE.value:
+        cfg.default_execution_mode = ExecutionMode.INTERACTIVE
+    elif env_execution_mode == ExecutionMode.BENCHMARK.value:
+        cfg.default_execution_mode = ExecutionMode.BENCHMARK
 
     # Per-seat env override: COUNCIL_MODEL_<SEAT_ID>.
     env_map: dict[str, str] = {}

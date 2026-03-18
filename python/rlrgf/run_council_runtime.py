@@ -15,11 +15,11 @@ if __package__ in {None, ""}:
         sys.path.insert(0, str(package_root))
     from rlrgf.council_runtime import CouncilRuntime
     from rlrgf.council_runtime_config import load_runtime_config
-    from rlrgf.council_runtime_schemas import CouncilMode, CouncilRequest
+    from rlrgf.council_runtime_schemas import CouncilMode, CouncilRequest, ExecutionMode
 else:
     from .council_runtime import CouncilRuntime
     from .council_runtime_config import load_runtime_config
-    from .council_runtime_schemas import CouncilMode, CouncilRequest
+    from .council_runtime_schemas import CouncilMode, CouncilRequest, ExecutionMode
 
 
 def _parse_mode(value: str) -> CouncilMode:
@@ -29,6 +29,15 @@ def _parse_mode(value: str) -> CouncilMode:
     if normalized in {"full", "full_council"}:
         return CouncilMode.FULL_COUNCIL
     raise argparse.ArgumentTypeError("mode must be one of: fast, full")
+
+
+def _parse_execution_mode(value: str) -> ExecutionMode:
+    normalized = value.strip().lower()
+    if normalized == ExecutionMode.INTERACTIVE.value:
+        return ExecutionMode.INTERACTIVE
+    if normalized == ExecutionMode.BENCHMARK.value:
+        return ExecutionMode.BENCHMARK
+    raise argparse.ArgumentTypeError("execution mode must be one of: interactive, benchmark")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -45,6 +54,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=_parse_mode,
         default=CouncilMode.FAST_COUNCIL,
         help="Council mode: fast or full (default: fast).",
+    )
+    parser.add_argument(
+        "--execution-mode",
+        type=_parse_execution_mode,
+        default=ExecutionMode.BENCHMARK,
+        help="Execution lane: interactive or benchmark (default: benchmark).",
     )
     parser.add_argument(
         "--config-path",
@@ -127,6 +142,7 @@ def main() -> int:
     request = CouncilRequest(
         query=query,
         mode=args.mode,
+        execution_mode=args.execution_mode,
         enable_revision_round=not args.no_revision_round,
         demo_mode=args.demo_mode,
         force_live_rerun=args.force_live_rerun,
@@ -151,6 +167,7 @@ def main() -> int:
         json.dumps(
             {
                 "mode": request.mode.value,
+                "execution_mode": request.execution_mode.value,
                 "escalated_to_full": trace.escalated_to_full,
                 "cached": trace.cached,
                 "disagreement_score": trace.disagreement_score,

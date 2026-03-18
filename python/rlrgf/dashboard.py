@@ -1042,11 +1042,10 @@ try:
     from .council_runtime import CouncilRuntime
     from .council_runtime_config import CouncilRuntimeConfig, load_runtime_config
     from .council_runtime_schemas import (
-        AvailabilityStatus,
         CouncilMode,
         CouncilRequest,
         CouncilRunTrace,
-        CouncilSeat,
+        ExecutionMode,
         FailureFlag,
     )
 except ImportError:
@@ -1054,11 +1053,10 @@ except ImportError:
     from rlrgf.council_runtime import CouncilRuntime
     from rlrgf.council_runtime_config import CouncilRuntimeConfig, load_runtime_config
     from rlrgf.council_runtime_schemas import (
-        AvailabilityStatus,
         CouncilMode,
         CouncilRequest,
         CouncilRunTrace,
-        CouncilSeat,
+        ExecutionMode,
         FailureFlag,
     )
     
@@ -1522,6 +1520,7 @@ def _dashboard_state_from_trace(
     final_response_metadata = {
         "final_answer": final_answer,
         "contract_version": trace.contract_version,
+        "execution_mode": trace.observability.execution_mode.value,
         "requested_mode": requested_mode,
         "effective_mode": effective_mode,
         "disagreement_score": (
@@ -1531,9 +1530,15 @@ def _dashboard_state_from_trace(
         "council_confidence": round(float(trace.council_confidence), 2),
         "quorum_success": bool(trace.quorum_success),
         "usable_contributor_count": usable_contributor_count,
+        "number_of_models_requested": trace.observability.number_of_models_requested,
+        "number_of_models_succeeded": trace.observability.number_of_models_succeeded,
+        "number_of_models_failed": trace.observability.number_of_models_failed,
+        "critique_enabled": trace.observability.critique_enabled,
+        "backend_type": trace.observability.backend_type,
         "failure_count": len(trace.failures),
         "failure_flags": sorted({failure.flag.value for failure in trace.failures}),
-        "latency_ms": total_latency,
+        "latency_ms": trace.observability.total_latency_ms or total_latency,
+        "per_model_latency_ms": dict(trace.observability.per_model_latency_ms),
     }
 
     return DashboardRuntimeState(
@@ -1551,7 +1556,15 @@ def _dashboard_state_from_trace(
         total_latency_ms=total_latency,
         observability={
             "cache_status": trace.observability.cache_status.value,
+            "execution_mode": trace.observability.execution_mode.value,
             "quorum_success": trace.observability.quorum_success,
+            "number_of_models_requested": trace.observability.number_of_models_requested,
+            "number_of_models_succeeded": trace.observability.number_of_models_succeeded,
+            "number_of_models_failed": trace.observability.number_of_models_failed,
+            "critique_enabled": trace.observability.critique_enabled,
+            "backend_type": trace.observability.backend_type,
+            "total_latency_ms": trace.observability.total_latency_ms,
+            "per_model_latency_ms": dict(trace.observability.per_model_latency_ms),
             "chair_selected_seat_id": trace.observability.chair_selected_seat_id,
             "chair_selected_model_id": trace.observability.chair_selected_model_id,
             "active_seat_ids": list(trace.observability.active_seat_ids),
@@ -1611,13 +1624,59 @@ def _quality_gate(
     return True, ""
 
 
-def _run_single_mode(prompt: str, requested_mode: str) -> CouncilRunTrace:
+def _execution_mode_for_dashboard(benchmark_mode: bool) -> ExecutionMode:
+    return ExecutionMode.BENCHMARK if benchmark_mode else ExecutionMode.INTERACTIVE
+
+
+def _runtime_cache_store() -> dict[str, CouncilRuntime]:
+    cache = st.session_state.get("council_runtime_cache")
+    if isinstance(cache, dict):
+        return cache
+    cache = {}
+    st.session_state["council_runtime_cache"] = cache
+    return cache
+
+
+def _runtime_cache_key(
+    execution_mode: ExecutionMode,
+    requested_mode: str,
+    use_real_models: bool,
+) -> str:
+    backend = "remote" if use_real_models else "mock"
+    return f"{execution_mode.value}:{requested_mode}:{backend}"
+
+
+def _run_single_mode(
+    prompt: str,
+    requested_mode: str,
+    *,
+    benchmark_mode: bool,
+) -> CouncilRunTrace:
     config = load_runtime_config()
+    execution_mode = _execution_mode_for_dashboard(benchmark_mode)
+    config.default_execution_mode = execution_mode
+    if (
+        execution_mode == ExecutionMode.INTERACTIVE
+        and config.interactive_prefer_remote
+        and bool((config.api_key or "").strip())
+    ):
+        config.use_real_models = True
+        if not config.base_url:
+            config.base_url = config.hf_router_base_url
+
     config, runtime_mode = _mode_config(config, requested_mode)
-    runtime = CouncilRuntime(config=config)
+    cache_key = _runtime_cache_key(execution_mode, requested_mode, config.use_real_models)
+    runtime_cache = _runtime_cache_store()
+    runtime = runtime_cache.get(cache_key)
+    if runtime is None:
+        runtime = CouncilRuntime(config=config)
+        runtime_cache[cache_key] = runtime
+        st.session_state["council_runtime_cache"] = runtime_cache
+
     request = CouncilRequest(
         query=prompt,
         mode=runtime_mode,
+        execution_mode=execution_mode,
         enable_revision_round=config.enable_revision_round,
         demo_mode=False,
         force_live_rerun=True,
@@ -1628,16 +1687,21 @@ def _run_single_mode(prompt: str, requested_mode: str) -> CouncilRunTrace:
 def run_adaptive_council(
     prompt: str,
     route: dict[str, Any],
+    *,
+    benchmark_mode: bool,
 ) -> tuple[DashboardRuntimeState, CouncilRunTrace]:
     initial_mode, selection_reason = _select_initial_mode(prompt, route)
-    sequence = _mode_sequence(initial_mode)
+    if benchmark_mode:
+        sequence = _mode_sequence(initial_mode)
+    else:
+        sequence = [INFERENCE_MODE_SOLO] if initial_mode == INFERENCE_MODE_SOLO else [INFERENCE_MODE_PARTIAL]
     escalation_notes: list[str] = []
     escalated = False
 
     latest_state: Optional[DashboardRuntimeState] = None
     latest_trace: Optional[CouncilRunTrace] = None
     for index, requested_mode in enumerate(sequence):
-        trace = _run_single_mode(prompt, requested_mode)
+        trace = _run_single_mode(prompt, requested_mode, benchmark_mode=benchmark_mode)
         latest_state = _dashboard_state_from_trace(
             trace,
             requested_mode=requested_mode,
@@ -1677,11 +1741,16 @@ def execute_council_turn(
     temperature: float,
     max_tokens: int,
     attach_context: bool,
+    benchmark_mode: bool = False,
     history_key: str = "chat_history",
 ):
     _ = (selected_models, mode, scenario_name, temperature, max_tokens, attach_context)
     route = llm_route(prompt)
-    runtime_state, trace = run_adaptive_council(prompt, route)
+    runtime_state, trace = run_adaptive_council(
+        prompt,
+        route,
+        benchmark_mode=benchmark_mode,
+    )
     final_answer = str(runtime_state.final_response_metadata.get("final_answer", "")).strip()
     if not final_answer:
         final_answer = FALLBACK_TEXT
@@ -1716,7 +1785,12 @@ def execute_council_turn(
         "per_model": per_model_payload,
         "metrics": {
             "verdict": verdict,
+            "execution_mode": runtime_state.final_response_metadata.get("execution_mode"),
+            "backend_type": runtime_state.final_response_metadata.get("backend_type"),
             "model_count": runtime_state.model_count,
+            "number_of_models_requested": runtime_state.final_response_metadata.get("number_of_models_requested"),
+            "number_of_models_succeeded": runtime_state.final_response_metadata.get("number_of_models_succeeded"),
+            "number_of_models_failed": runtime_state.final_response_metadata.get("number_of_models_failed"),
             "latency_ms": runtime_state.total_latency_ms,
             "council_confidence": runtime_state.final_response_metadata.get("council_confidence"),
             "disagreement_score": runtime_state.final_response_metadata.get("disagreement_score"),
@@ -1758,6 +1832,13 @@ def render_turn_runtime_metadata(turn: dict[str, Any]) -> None:
     if not isinstance(runtime_state, dict):
         return
 
+    observability = runtime_state.get("observability", {})
+    if not isinstance(observability, dict):
+        observability = {}
+    metadata = runtime_state.get("final_response_metadata", {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+
     mode = runtime_state.get("inference_mode", "unknown")
     escalated = bool(runtime_state.get("escalated", False))
     degraded_quorum = bool(runtime_state.get("degraded_quorum", False))
@@ -1767,11 +1848,29 @@ def render_turn_runtime_metadata(turn: dict[str, Any]) -> None:
     model_count = runtime_state.get("model_count", 0)
     latency_ms = runtime_state.get("total_latency_ms")
     latency_label = f"{latency_ms} ms" if latency_ms is not None else "N/A"
+    execution_mode = (
+        observability.get("execution_mode")
+        or metadata.get("execution_mode")
+        or "unknown"
+    )
+    backend_type = (
+        observability.get("backend_type")
+        or metadata.get("backend_type")
+        or "unknown"
+    )
+    requested_models = metadata.get("number_of_models_requested", model_count)
+    succeeded_models = metadata.get("number_of_models_succeeded")
+    failed_models = metadata.get("number_of_models_failed")
 
     st.caption(
         f"Mode: `{mode}` | Escalated: `{str(escalated).lower()}` | "
+        f"Exec lane: `{execution_mode}` | Backend: `{backend_type}` | "
         f"Models: `{model_count}` | Latency: `{latency_label}`"
     )
+    if succeeded_models is not None and failed_models is not None:
+        st.caption(
+            f"Model outcomes: requested `{requested_models}`, succeeded `{succeeded_models}`, failed `{failed_models}`."
+        )
     if selection_reason:
         st.caption(f"Selection reason: {selection_reason}")
     if escalated and escalation_reason:
@@ -1799,10 +1898,20 @@ def render_live_model_performance(history_key: str):
         return
 
     mode = runtime_state.get("inference_mode", INFERENCE_MODE_SOLO)
+    observability = runtime_state.get("observability", {})
+    if not isinstance(observability, dict):
+        observability = {}
     cards = runtime_state.get("per_model", [])
     if not cards:
         st.warning("No per-model telemetry was emitted for this query.")
         return
+
+    execution_mode = str(observability.get("execution_mode", "unknown"))
+    backend_type = str(observability.get("backend_type", "unknown"))
+    critique_enabled = bool(observability.get("critique_enabled", False))
+    st.caption(
+        f"Execution lane: `{execution_mode}` | Backend: `{backend_type}` | Critique enabled: `{str(critique_enabled).lower()}`"
+    )
 
     if runtime_state.get("degraded_quorum", False):
         st.warning(
@@ -1924,6 +2033,7 @@ def render_council_chat(df: pd.DataFrame | None):
                     temperature,
                     max_tokens,
                     attach_context,
+                    benchmark_mode=benchmark_mode,
                     history_key=history_key,
                 )
             st.rerun()

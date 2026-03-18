@@ -11,7 +11,7 @@ from pathlib import Path
 
 from .council_runtime import CouncilRuntime
 from .council_runtime_config import load_runtime_config
-from .council_runtime_schemas import CouncilMode, CouncilRequest
+from .council_runtime_schemas import CouncilMode, CouncilRequest, ExecutionMode
 
 
 def _parse_modes(raw: str) -> list[CouncilMode]:
@@ -29,6 +29,15 @@ def _parse_modes(raw: str) -> list[CouncilMode]:
     return modes
 
 
+def _parse_execution_mode(raw: str) -> ExecutionMode:
+    normalized = raw.strip().lower()
+    if normalized == ExecutionMode.INTERACTIVE.value:
+        return ExecutionMode.INTERACTIVE
+    if normalized == ExecutionMode.BENCHMARK.value:
+        return ExecutionMode.BENCHMARK
+    raise ValueError("execution mode must be interactive or benchmark")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run council runtime smoke prompts.")
     parser.add_argument(
@@ -42,6 +51,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default="fast,full",
         help="Comma-separated modes: fast,full",
+    )
+    parser.add_argument(
+        "--execution-mode",
+        type=str,
+        default=ExecutionMode.BENCHMARK.value,
+        help="Execution lane for all smoke calls: interactive|benchmark (default: benchmark).",
     )
     parser.add_argument(
         "--config-path",
@@ -125,6 +140,7 @@ def main() -> int:
         raise SystemExit("Cannot set both --use-real-models and --use-mock-models.")
 
     modes = _parse_modes(args.modes)
+    execution_mode = _parse_execution_mode(args.execution_mode)
     prompt_pack_path = _resolve_prompt_pack_path(Path(args.prompt_pack))
     prompts = _load_prompt_pack(prompt_pack_path)
 
@@ -159,6 +175,7 @@ def main() -> int:
             request = CouncilRequest(
                 query=prompt["query"],
                 mode=mode,
+                execution_mode=execution_mode,
                 demo_mode=args.demo_mode,
                 force_live_rerun=args.force_live_rerun,
             )
@@ -168,6 +185,7 @@ def main() -> int:
                 "category": prompt["category"],
                 "query": prompt["query"],
                 "mode": mode.value,
+                "execution_mode": execution_mode.value,
                 "contract_version": trace.contract_version,
                 "final_answer": (
                     trace.final_synthesis.final_answer if trace.final_synthesis else ""
@@ -197,6 +215,7 @@ def main() -> int:
         "total_runs": len(runs),
         "total_prompts": len(prompts),
         "modes": [mode.value for mode in modes],
+        "execution_mode": execution_mode.value,
         "escalation_count": sum(1 for run in runs if run["escalated_to_full"]),
         "fallback_count": sum(1 for run in runs if run["fallback_used"]),
         "quorum_failure_count": sum(1 for run in runs if not run["quorum_success"]),

@@ -6,6 +6,7 @@ from pathlib import Path
 
 import rlrgf.council_runtime_config as runtime_config_module
 from rlrgf.council_runtime_config import CouncilRuntimeConfig, load_runtime_config
+from rlrgf.council_runtime_schemas import ExecutionMode
 
 
 def test_with_seat_model_overrides_updates_only_targeted_seat() -> None:
@@ -140,3 +141,39 @@ def test_explicit_env_switch_can_disable_real_models(tmp_path: Path, monkeypatch
     loaded = load_runtime_config(str(config_path))
 
     assert loaded.use_real_models is False
+
+
+def test_load_runtime_config_parses_execution_mode_and_critique_flags(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        runtime_config_module, "HF_TOKEN_FILE_PATH", tmp_path / "missing_hf_token.txt"
+    )
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    config_path = tmp_path / "council_models.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "default_execution_mode": "interactive",
+                "benchmark_enable_pairwise_critique": True,
+                "benchmark_enable_summary_review": False,
+                "interactive_max_models": 1,
+                "interactive_enable_secondary_review": True,
+                "interactive_prefer_remote": True,
+                "interactive_disable_cpu_fallback": True,
+                "interactive_skip_heavy_probe": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_runtime_config(str(config_path))
+
+    assert loaded.default_execution_mode == ExecutionMode.INTERACTIVE
+    assert loaded.benchmark_enable_pairwise_critique is True
+    assert loaded.benchmark_enable_summary_review is False
+    assert loaded.interactive_max_models == 1
+    assert loaded.interactive_enable_secondary_review is True
+    assert loaded.interactive_prefer_remote is True
+    assert loaded.interactive_disable_cpu_fallback is True
+    assert loaded.interactive_skip_heavy_probe is True
