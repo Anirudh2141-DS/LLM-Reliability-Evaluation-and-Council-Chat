@@ -4,13 +4,14 @@ Remote inference adapter for OpenAI-compatible chat endpoints.
 
 from __future__ import annotations
 
+import asyncio
 import ast
 from dataclasses import dataclass
 import json
 import logging
 import re
 import time
-from typing import Any, Optional, Protocol, TypeVar
+from typing import Any, Awaitable, Callable, Optional, Protocol, TypeVar
 
 import httpx
 from pydantic import BaseModel, ValidationError
@@ -47,6 +48,18 @@ class RemoteInferenceResult:
 
 class CouncilInferenceAdapter(Protocol):
     def call_json(
+        self,
+        *,
+        model_id: str,
+        messages: list[dict[str, str]],
+        schema_model: type[SchemaT],
+        timeout_s: float,
+        temperature: float = 0.2,
+        max_tokens: int = 900,
+    ) -> tuple[Optional[SchemaT], RemoteInferenceResult, Optional[str]]:
+        ...
+
+    async def call_json_async(
         self,
         *,
         model_id: str,
@@ -103,6 +116,25 @@ class MockCouncilInferenceAdapter:
             result.usable_for_quorum = False
             return None, result, str(error)
 
+    async def call_json_async(
+        self,
+        *,
+        model_id: str,
+        messages: list[dict[str, str]],
+        schema_model: type[SchemaT],
+        timeout_s: float,
+        temperature: float = 0.2,
+        max_tokens: int = 900,
+    ) -> tuple[Optional[SchemaT], RemoteInferenceResult, Optional[str]]:
+        return self.call_json(
+            model_id=model_id,
+            messages=messages,
+            schema_model=schema_model,
+            timeout_s=timeout_s,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+
 
 class OpenAICompatibleInferenceAdapter:
     """
@@ -141,6 +173,10 @@ class OpenAICompatibleInferenceAdapter:
     def _sleep_backoff(self, attempt: int) -> None:
         delay = min(self.retry_backoff_cap_s, self.retry_backoff_s * (2**attempt))
         time.sleep(delay)
+
+    async def _sleep_backoff_async(self, attempt: int) -> None:
+        delay = min(self.retry_backoff_cap_s, self.retry_backoff_s * (2**attempt))
+        await asyncio.sleep(delay)
 
     def chat(
         self,
@@ -265,6 +301,129 @@ class OpenAICompatibleInferenceAdapter:
             retry_count=retries,
         )
 
+    async def chat_async(
+        self,
+        *,
+        model_id: str,
+        messages: list[dict[str, str]],
+        timeout_s: float,
+        temperature: float = 0.2,
+        max_tokens: int = 900,
+        response_format_json: bool = True,
+    ) -> RemoteInferenceResult:
+        if not self.base_url:
+            return RemoteInferenceResult(
+                status="unavailable",
+                text="",
+                latency_ms=0.0,
+                model_id=model_id,
+                error="COUNCIL_API_BASE_URL is not configured.",
+            )
+
+        url = self._chat_url()
+        payload: dict[str, Any] = {
+            "model": model_id,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        if response_format_json:
+            payload["response_format"] = {"type": "json_object"}
+
+        retries = self.max_retries
+        async with httpx.AsyncClient() as client:
+            for attempt in range(retries + 1):
+                start = time.perf_counter()
+                try:
+                    response = await client.post(
+                        url,
+                        headers=self._headers(),
+                        json=payload,
+                        timeout=min(timeout_s, self.request_timeout_s),
+                    )
+                    latency_ms = (time.perf_counter() - start) * 1000.0
+
+                    if response.status_code in (408, 429) or response.status_code >= 500:
+                        if attempt < retries:
+                            await self._sleep_backoff_async(attempt)
+                            continue
+                        return RemoteInferenceResult(
+                            status="error",
+                            text="",
+                            latency_ms=latency_ms,
+                            model_id=model_id,
+                            error=f"HTTP {response.status_code}: retry budget exhausted.",
+                            retry_count=attempt,
+                            http_status=response.status_code,
+                        )
+
+                    if response.status_code >= 400:
+                        status = (
+                            "unavailable"
+                            if response.status_code in (401, 403, 404)
+                            else "error"
+                        )
+                        return RemoteInferenceResult(
+                            status=status,
+                            text="",
+                            latency_ms=latency_ms,
+                            model_id=model_id,
+                            error=f"HTTP {response.status_code}: {response.text[:300]}",
+                            retry_count=attempt,
+                            http_status=response.status_code,
+                        )
+
+                    body = response.json()
+                    content = _extract_content(body)
+                    usage = body.get("usage", {}) if isinstance(body, dict) else {}
+                    return RemoteInferenceResult(
+                        status="ok",
+                        text=content.strip(),
+                        latency_ms=latency_ms,
+                        model_id=model_id,
+                        prompt_tokens=_coerce_int(usage.get("prompt_tokens")),
+                        completion_tokens=_coerce_int(usage.get("completion_tokens")),
+                        total_tokens=_coerce_int(usage.get("total_tokens")),
+                        retry_count=attempt,
+                        http_status=response.status_code,
+                    )
+                except httpx.TimeoutException:
+                    latency_ms = (time.perf_counter() - start) * 1000.0
+                    if attempt < retries:
+                        await self._sleep_backoff_async(attempt)
+                        continue
+                    return RemoteInferenceResult(
+                        status="timeout",
+                        text="",
+                        latency_ms=latency_ms,
+                        model_id=model_id,
+                        error="Request timed out.",
+                        retry_count=attempt,
+                    )
+                except Exception as error:  # pragma: no cover - defensive branch
+                    latency_ms = (time.perf_counter() - start) * 1000.0
+                    logger.warning("Remote call failed for %s: %s", model_id, error)
+                    if attempt < retries:
+                        await self._sleep_backoff_async(attempt)
+                        continue
+                    return RemoteInferenceResult(
+                        status="error",
+                        text="",
+                        latency_ms=latency_ms,
+                        model_id=model_id,
+                        error=str(error),
+                        retry_count=attempt,
+                    )
+
+        return RemoteInferenceResult(
+            status="error",
+            text="",
+            latency_ms=0.0,
+            model_id=model_id,
+            error="Unexpected retry loop exit.",
+            retry_count=retries,
+        )
+
     def call_json(
         self,
         *,
@@ -275,7 +434,53 @@ class OpenAICompatibleInferenceAdapter:
         temperature: float = 0.2,
         max_tokens: int = 900,
     ) -> tuple[Optional[SchemaT], RemoteInferenceResult, Optional[str]]:
-        result = self.chat(
+        async def _chat_via_sync(**chat_kwargs: Any) -> RemoteInferenceResult:
+            return self.chat(**chat_kwargs)
+
+        return _run_coroutine(
+            self._call_json_via_chat(
+                chat_fn=_chat_via_sync,
+                model_id=model_id,
+                messages=messages,
+                schema_model=schema_model,
+                timeout_s=timeout_s,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+        )
+
+    async def call_json_async(
+        self,
+        *,
+        model_id: str,
+        messages: list[dict[str, str]],
+        schema_model: type[SchemaT],
+        timeout_s: float,
+        temperature: float = 0.2,
+        max_tokens: int = 900,
+    ) -> tuple[Optional[SchemaT], RemoteInferenceResult, Optional[str]]:
+        return await self._call_json_via_chat(
+            chat_fn=self.chat_async,
+            model_id=model_id,
+            messages=messages,
+            schema_model=schema_model,
+            timeout_s=timeout_s,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+
+    async def _call_json_via_chat(
+        self,
+        *,
+        chat_fn: Callable[..., Awaitable[RemoteInferenceResult]],
+        model_id: str,
+        messages: list[dict[str, str]],
+        schema_model: type[SchemaT],
+        timeout_s: float,
+        temperature: float = 0.2,
+        max_tokens: int = 900,
+    ) -> tuple[Optional[SchemaT], RemoteInferenceResult, Optional[str]]:
+        result = await chat_fn(
             model_id=model_id,
             messages=messages,
             timeout_s=timeout_s,
@@ -314,7 +519,7 @@ class OpenAICompatibleInferenceAdapter:
 
         # One repair pass on malformed JSON/validation failure.
         repair_messages = build_json_repair_messages(result.text, schema_model)
-        repair_result = self.chat(
+        repair_result = await chat_fn(
             model_id=model_id,
             messages=repair_messages,
             timeout_s=timeout_s,
@@ -351,7 +556,7 @@ class OpenAICompatibleInferenceAdapter:
                     return (
                         model,
                         result,
-                        f"repaired_json: {parse_error_type or repair_error_type or 'recovered malformed json'}",
+                        None,
                     )
                 except ValidationError as error:
                     repair_error = str(error)
@@ -412,6 +617,8 @@ def _plain_text_fallback_payload(
     raw_text: str,
 ) -> tuple[Optional[dict[str, Any]], str]:
     fallback_text = _normalize_plain_text_fallback(raw_text)
+    if _looks_like_broken_json_fragment(fallback_text):
+        return None, ""
     if not fallback_text:
         return None, ""
     name = schema_model.__name__
@@ -477,6 +684,15 @@ def _normalize_plain_text_fallback(text: str) -> str:
     ).strip()
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned[:2000]
+
+
+def _looks_like_broken_json_fragment(text: str) -> bool:
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return False
+    if cleaned[0] not in "{[":
+        return False
+    return _load_json_candidate(cleaned) is None
 
 
 class HuggingFaceRouterInferenceAdapter(OpenAICompatibleInferenceAdapter):
@@ -627,6 +843,17 @@ def _sum_optional_int(left: Optional[int], right: Optional[int]) -> Optional[int
     if left is None and right is None:
         return None
     return int(left or 0) + int(right or 0)
+
+
+def _run_coroutine(coroutine: Any) -> Any:
+    try:
+        return asyncio.run(coroutine)
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coroutine)
+        finally:
+            loop.close()
 
 
 def _merge_errors(primary: Optional[str], secondary: Optional[str]) -> str:

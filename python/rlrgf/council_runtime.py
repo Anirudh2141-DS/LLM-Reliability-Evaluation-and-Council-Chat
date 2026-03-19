@@ -10,6 +10,7 @@ import json
 import logging
 from pathlib import Path
 from statistics import mean
+import time
 from typing import Any, Optional
 
 from .council_runtime_config import CouncilRuntimeConfig, load_runtime_config
@@ -85,6 +86,7 @@ class CouncilRuntime:
         self._log_adapter_selection()
 
     def run(self, request: CouncilRequest) -> CouncilRunTrace:
+        request_started = time.perf_counter()
         cache_key = self._cache_key(request)
 
         if request.demo_mode and not request.force_live_rerun:
@@ -119,6 +121,11 @@ class CouncilRuntime:
         trace.observability.effective_mode = effective_mode
         trace.observability.quorum_success = trace.quorum_success
         self._finalize_observability(trace)
+        trace.observability.request_wall_time_ms = round(
+            max(0.0, (time.perf_counter() - request_started) * 1000.0),
+            1,
+        )
+        self._log_run_summary(trace)
 
         if request.demo_mode:
             self._write_cached_trace(cache_key, trace)
@@ -137,10 +144,14 @@ class CouncilRuntime:
         trace.active_seats = selected_seats
         self._sync_active_seat_observability(trace)
 
-        initial_answers = self._run_initial_round(
-            request=request,
-            seats=trace.active_seats,
+        initial_answers = self._time_stage(
             trace=trace,
+            stage_name="initial_round",
+            operation=lambda: self._run_initial_round(
+                request=request,
+                seats=trace.active_seats,
+                trace=trace,
+            ),
         )
         trace.initial_answers = initial_answers
         trace.escalated_to_full = False
@@ -153,42 +164,68 @@ class CouncilRuntime:
             and len(trace.active_seats) > 1
         )
         if interactive_review_enabled:
-            trace.peer_critiques = self._run_summary_review(
-                request=request,
-                seats=trace.active_seats,
-                initial_answers=trace.initial_answers,
+            trace.peer_critiques = self._time_stage(
                 trace=trace,
+                stage_name="critique",
+                operation=lambda: self._run_summary_review(
+                    request=request,
+                    seats=trace.active_seats,
+                    initial_answers=trace.initial_answers,
+                    trace=trace,
+                ),
             )
         else:
             trace.peer_critiques = []
-        trace.observability.critique_enabled = bool(trace.peer_critiques)
+        trace.observability.critique_enabled = self._critique_attempted(trace)
         trace.revised_answers = []
 
-        trace.scorecards = self._build_scorecards_safely(trace)
-        trace.disagreement_score = compute_disagreement_score(trace.initial_answers)
-        trace.council_confidence = compute_council_confidence(
-            trace.scorecards, trace.disagreement_score
-        )
-        ready_model_count = self._usable_initial_contributor_count(
-            trace=trace,
-            seat_ids={seat.seat_id for seat in trace.active_seats},
-        )
-        # Interactive path must degrade gracefully and stay usable with one surviving model.
-        trace.quorum_success = ready_model_count >= 1
+        def _aggregate_interactive() -> tuple[
+            list[ModelScoreCard],
+            float,
+            float,
+            bool,
+            FinalSynthesis,
+        ]:
+            scorecards = self._build_scorecards_safely(trace)
+            disagreement_score = compute_disagreement_score(trace.initial_answers)
+            council_confidence = compute_council_confidence(scorecards, disagreement_score)
+            ready_model_count = self._usable_initial_contributor_count(
+                trace=trace,
+                seat_ids={seat.seat_id for seat in trace.active_seats},
+            )
+            chair = self._select_chair(trace.active_seats, scorecards)
+            chair_candidates = self._chair_candidates(
+                primary_chair=chair,
+                seats=trace.active_seats,
+                scorecards=scorecards,
+            )
+            final_synthesis = self._run_synthesis(
+                request=request,
+                chairs=chair_candidates,
+                initial_answers=trace.initial_answers,
+                critiques=trace.peer_critiques,
+                revisions=trace.revised_answers,
+                trace=trace,
+            )
+            # Interactive path must degrade gracefully and stay usable with one surviving model.
+            return (
+                scorecards,
+                disagreement_score,
+                council_confidence,
+                ready_model_count >= 1,
+                final_synthesis,
+            )
 
-        chair = self._select_chair(trace.active_seats, trace.scorecards)
-        chair_candidates = self._chair_candidates(
-            primary_chair=chair,
-            seats=trace.active_seats,
-            scorecards=trace.scorecards,
-        )
-        trace.final_synthesis = self._run_synthesis(
-            request=request,
-            chairs=chair_candidates,
-            initial_answers=trace.initial_answers,
-            critiques=trace.peer_critiques,
-            revisions=trace.revised_answers,
+        (
+            trace.scorecards,
+            trace.disagreement_score,
+            trace.council_confidence,
+            trace.quorum_success,
+            trace.final_synthesis,
+        ) = self._time_stage(
             trace=trace,
+            stage_name="aggregation",
+            operation=_aggregate_interactive,
         )
         trace.observability.fallback_used = (
             trace.final_synthesis.fallback_used if trace.final_synthesis is not None else True
@@ -205,43 +242,50 @@ class CouncilRuntime:
         trace.active_seats = self.config.active_seats(effective_mode)
         self._sync_active_seat_observability(trace)
 
-        initial_answers = self._run_initial_round_parallel(
-            request=request,
-            seats=trace.active_seats,
+        def _collect_initial_answers() -> list[InitialAnswer]:
+            initial_answers = self._run_initial_round_parallel(
+                request=request,
+                seats=trace.active_seats,
+                trace=trace,
+            )
+            if request.mode == CouncilMode.FAST_COUNCIL:
+                disagreement_score = compute_disagreement_score(initial_answers)
+                bootstrap_confidence = self._bootstrap_confidence(initial_answers)
+                escalation_reasons = self._fast_escalation_reasons(
+                    disagreement_score=disagreement_score,
+                    council_confidence=bootstrap_confidence,
+                    ready_model_count=self._usable_initial_contributor_count(
+                        trace=trace,
+                        seat_ids={seat.seat_id for seat in trace.active_seats},
+                    ),
+                )
+                if escalation_reasons:
+                    trace.escalated_to_full = True
+                    trace.observability.escalation_triggered = True
+                    trace.observability.escalation_reason = "; ".join(escalation_reasons)
+                    effective_mode_local = CouncilMode.FULL_COUNCIL
+                    full_seats = self.config.active_seats(CouncilMode.FULL_COUNCIL)
+                    seen_ids = {answer.seat_id for answer in initial_answers}
+                    missing = [seat for seat in full_seats if seat.seat_id not in seen_ids]
+                    if missing:
+                        initial_answers.extend(
+                            self._run_initial_round_parallel(
+                                request=request,
+                                seats=missing,
+                                trace=trace,
+                            )
+                        )
+                    trace.active_seats = full_seats
+                    self._sync_active_seat_observability(trace)
+                    return initial_answers, effective_mode_local
+            return initial_answers, effective_mode
+
+        initial_answers, effective_mode = self._time_stage(
             trace=trace,
+            stage_name="initial_round",
+            operation=_collect_initial_answers,
         )
         trace.initial_answers = initial_answers
-
-        if request.mode == CouncilMode.FAST_COUNCIL:
-            disagreement_score = compute_disagreement_score(initial_answers)
-            bootstrap_confidence = self._bootstrap_confidence(initial_answers)
-            escalation_reasons = self._fast_escalation_reasons(
-                disagreement_score=disagreement_score,
-                council_confidence=bootstrap_confidence,
-                ready_model_count=self._usable_initial_contributor_count(
-                    trace=trace,
-                    seat_ids={seat.seat_id for seat in trace.active_seats},
-                ),
-            )
-            if escalation_reasons:
-                trace.escalated_to_full = True
-                trace.observability.escalation_triggered = True
-                trace.observability.escalation_reason = "; ".join(escalation_reasons)
-                effective_mode = CouncilMode.FULL_COUNCIL
-                full_seats = self.config.active_seats(CouncilMode.FULL_COUNCIL)
-                seen_ids = {answer.seat_id for answer in initial_answers}
-                missing = [seat for seat in full_seats if seat.seat_id not in seen_ids]
-                if missing:
-                    initial_answers.extend(
-                        self._run_initial_round_parallel(
-                            request=request,
-                            seats=missing,
-                            trace=trace,
-                        )
-                    )
-                trace.initial_answers = initial_answers
-                trace.active_seats = full_seats
-                self._sync_active_seat_observability(trace)
 
         pairwise_critique_enabled = (
             request.enable_revision_round
@@ -254,66 +298,101 @@ class CouncilRuntime:
             and not pairwise_critique_enabled
             and self.config.benchmark_enable_summary_review
         )
-        trace.observability.critique_enabled = (
-            pairwise_critique_enabled or summary_review_enabled
-        )
 
         if pairwise_critique_enabled:
-            trace.peer_critiques = self._run_peer_critiques(
-                request=request,
-                seats=trace.active_seats,
-                initial_answers=trace.initial_answers,
+            trace.peer_critiques = self._time_stage(
                 trace=trace,
+                stage_name="critique",
+                operation=lambda: self._run_peer_critiques(
+                    request=request,
+                    seats=trace.active_seats,
+                    initial_answers=trace.initial_answers,
+                    trace=trace,
+                ),
             )
         elif summary_review_enabled:
-            trace.peer_critiques = self._run_summary_review(
-                request=request,
-                seats=trace.active_seats,
-                initial_answers=trace.initial_answers,
+            trace.peer_critiques = self._time_stage(
                 trace=trace,
+                stage_name="critique",
+                operation=lambda: self._run_summary_review(
+                    request=request,
+                    seats=trace.active_seats,
+                    initial_answers=trace.initial_answers,
+                    trace=trace,
+                ),
             )
         else:
             trace.peer_critiques = []
+        trace.observability.critique_enabled = self._critique_attempted(trace)
 
         if pairwise_critique_enabled:
-            trace.revised_answers = self._run_revision_round(
-                request=request,
-                seats=trace.active_seats,
-                initial_answers=trace.initial_answers,
-                critiques=trace.peer_critiques,
+            trace.revised_answers = self._time_stage(
                 trace=trace,
+                stage_name="revision",
+                operation=lambda: self._run_revision_round(
+                    request=request,
+                    seats=trace.active_seats,
+                    initial_answers=trace.initial_answers,
+                    critiques=trace.peer_critiques,
+                    trace=trace,
+                ),
             )
         else:
             trace.revised_answers = []
 
-        trace.scorecards = self._build_scorecards_safely(trace)
-        trace.disagreement_score = compute_disagreement_score(trace.initial_answers)
-        trace.council_confidence = compute_council_confidence(
-            trace.scorecards, trace.disagreement_score
-        )
-        ready_model_count = self._usable_initial_contributor_count(
-            trace=trace,
-            seat_ids={seat.seat_id for seat in trace.active_seats},
-        )
-        trace.quorum_success = quorum_success(
-            config=self.config,
-            mode=effective_mode.value,
-            ready_model_count=ready_model_count,
-        )
+        def _aggregate_benchmark() -> tuple[
+            list[ModelScoreCard],
+            float,
+            float,
+            bool,
+            FinalSynthesis,
+        ]:
+            scorecards = self._build_scorecards_safely(trace)
+            disagreement_score = compute_disagreement_score(trace.initial_answers)
+            council_confidence = compute_council_confidence(
+                scorecards, disagreement_score
+            )
+            ready_model_count = self._usable_initial_contributor_count(
+                trace=trace,
+                seat_ids={seat.seat_id for seat in trace.active_seats},
+            )
+            quorum_ok = quorum_success(
+                config=self.config,
+                mode=effective_mode.value,
+                ready_model_count=ready_model_count,
+            )
+            chair = self._select_chair(trace.active_seats, scorecards)
+            chair_candidates = self._chair_candidates(
+                primary_chair=chair,
+                seats=trace.active_seats,
+                scorecards=scorecards,
+            )
+            final_synthesis = self._run_synthesis(
+                request=request,
+                chairs=chair_candidates,
+                initial_answers=trace.initial_answers,
+                critiques=trace.peer_critiques,
+                revisions=trace.revised_answers,
+                trace=trace,
+            )
+            return (
+                scorecards,
+                disagreement_score,
+                council_confidence,
+                quorum_ok,
+                final_synthesis,
+            )
 
-        chair = self._select_chair(trace.active_seats, trace.scorecards)
-        chair_candidates = self._chair_candidates(
-            primary_chair=chair,
-            seats=trace.active_seats,
-            scorecards=trace.scorecards,
-        )
-        trace.final_synthesis = self._run_synthesis(
-            request=request,
-            chairs=chair_candidates,
-            initial_answers=trace.initial_answers,
-            critiques=trace.peer_critiques,
-            revisions=trace.revised_answers,
+        (
+            trace.scorecards,
+            trace.disagreement_score,
+            trace.council_confidence,
+            trace.quorum_success,
+            trace.final_synthesis,
+        ) = self._time_stage(
             trace=trace,
+            stage_name="aggregation",
+            operation=_aggregate_benchmark,
         )
         trace.observability.fallback_used = (
             trace.final_synthesis.fallback_used if trace.final_synthesis is not None else True
@@ -365,8 +444,7 @@ class CouncilRuntime:
         ]:
             messages = build_initial_answer_messages(request, seat)
             try:
-                payload, result, parse_error = await asyncio.to_thread(
-                    self.adapter.call_json,
+                payload, result, parse_error = await self._call_adapter_json_async(
                     model_id=seat.model_id,
                     messages=messages,
                     schema_model=InitialAnswerPayload,
@@ -529,7 +607,7 @@ class CouncilRuntime:
             if answer.seat_id != reviewer_seat.seat_id
         ]
         messages = build_peer_critique_messages(request, reviewer_seat, peer_answers)
-        payload, result, parse_error = self.adapter.call_json(
+        payload, result, parse_error = self._call_adapter_json(
             model_id=reviewer_seat.model_id,
             messages=messages,
             schema_model=PeerCritiquePayload,
@@ -599,6 +677,91 @@ class CouncilRuntime:
         )
         return [critique]
 
+    def _time_stage(
+        self,
+        *,
+        trace: CouncilRunTrace,
+        stage_name: str,
+        operation: Any,
+    ) -> Any:
+        started = time.perf_counter()
+        try:
+            return operation()
+        finally:
+            elapsed_ms = max(0.0, (time.perf_counter() - started) * 1000.0)
+            current = trace.observability.stage_latency_ms.get(stage_name, 0.0)
+            trace.observability.stage_latency_ms[stage_name] = round(
+                current + elapsed_ms,
+                1,
+            )
+
+    def _critique_attempted(self, trace: CouncilRunTrace) -> bool:
+        return any(
+            item.stage == CouncilStage.PEER_CRITIQUE and item.attempted > 0
+            for item in trace.observability.round_stats
+        )
+
+    def _call_adapter_json(
+        self,
+        *,
+        model_id: str,
+        messages: list[dict[str, str]],
+        schema_model: Any,
+        timeout_s: float,
+        temperature: float = 0.2,
+        max_tokens: int = 900,
+    ) -> tuple[Any, RemoteInferenceResult, Optional[str]]:
+        async_call = getattr(self.adapter, "call_json_async", None)
+        if callable(async_call):
+            return self._run_async(
+                async_call(
+                    model_id=model_id,
+                    messages=messages,
+                    schema_model=schema_model,
+                    timeout_s=timeout_s,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+            )
+        return self.adapter.call_json(
+            model_id=model_id,
+            messages=messages,
+            schema_model=schema_model,
+            timeout_s=timeout_s,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+
+    async def _call_adapter_json_async(
+        self,
+        *,
+        model_id: str,
+        messages: list[dict[str, str]],
+        schema_model: Any,
+        timeout_s: float,
+        temperature: float = 0.2,
+        max_tokens: int = 900,
+    ) -> tuple[Any, RemoteInferenceResult, Optional[str]]:
+        async_call = getattr(self.adapter, "call_json_async", None)
+        if callable(async_call):
+            return await async_call(
+                model_id=model_id,
+                messages=messages,
+                schema_model=schema_model,
+                timeout_s=timeout_s,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+        return await asyncio.to_thread(
+            self.adapter.call_json,
+            model_id=model_id,
+            messages=messages,
+            schema_model=schema_model,
+            timeout_s=timeout_s,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+
     def _finalize_observability(self, trace: CouncilRunTrace) -> None:
         seat_ids = {seat.seat_id for seat in trace.active_seats}
         requested = len(trace.active_seats)
@@ -621,6 +784,20 @@ class CouncilRuntime:
             model_id: round(latency, 1)
             for model_id, latency in per_model_latency.items()
         }
+
+    def _log_run_summary(self, trace: CouncilRunTrace) -> None:
+        logger.info(
+            "Council runtime completed | execution_mode=%s | requested_mode=%s | effective_mode=%s | backend=%s | quorum_success=%s | request_wall_time_ms=%.1f | total_model_latency_ms=%.1f | stage_latency_ms=%s | failures=%s",
+            trace.observability.execution_mode.value,
+            trace.observability.requested_mode.value,
+            trace.observability.effective_mode.value,
+            trace.observability.backend_type,
+            trace.quorum_success,
+            trace.observability.request_wall_time_ms,
+            trace.observability.total_latency_ms,
+            trace.observability.stage_latency_ms,
+            len(trace.failures),
+        )
 
     def _run_async(self, coroutine: Any) -> Any:
         try:
@@ -706,7 +883,7 @@ class CouncilRuntime:
         for seat in seats:
             attempted += 1
             messages = build_initial_answer_messages(request, seat)
-            payload, result, parse_error = self.adapter.call_json(
+            payload, result, parse_error = self._call_adapter_json(
                 model_id=seat.model_id,
                 messages=messages,
                 schema_model=InitialAnswerPayload,
@@ -771,10 +948,7 @@ class CouncilRuntime:
     ) -> list[PeerCritique]:
         answers_by_id = {answer.seat_id: answer for answer in initial_answers}
         critiques: list[PeerCritique] = []
-        attempted = 0
-        succeeded = 0
-        failed = 0
-
+        work_items: list[tuple[CouncilSeat, list[dict[str, str]]]] = []
         for seat in seats:
             if answers_by_id.get(seat.seat_id) is None:
                 continue
@@ -785,17 +959,92 @@ class CouncilRuntime:
             ]
             if not peer_answers:
                 continue
-            attempted += 1
-
-            messages = build_peer_critique_messages(request, seat, peer_answers)
-            payload, result, parse_error = self.adapter.call_json(
-                model_id=seat.model_id,
-                messages=messages,
-                schema_model=PeerCritiquePayload,
-                timeout_s=self.config.model_timeout_s,
-                temperature=0.0,
-                max_tokens=1100,
+            work_items.append(
+                (seat, build_peer_critique_messages(request, seat, peer_answers))
             )
+
+        attempted = len(work_items)
+        if not work_items:
+            self._update_round_stats(
+                trace=trace,
+                stage=CouncilStage.PEER_CRITIQUE,
+                attempted=0,
+                succeeded=0,
+                failed=0,
+            )
+            return []
+
+        async def _invoke_for_seat(
+            seat: CouncilSeat,
+            messages: list[dict[str, str]],
+        ) -> tuple[
+            CouncilSeat,
+            list[dict[str, str]],
+            Optional[PeerCritiquePayload],
+            RemoteInferenceResult,
+            Optional[str],
+        ]:
+            try:
+                payload, result, parse_error = await self._call_adapter_json_async(
+                    model_id=seat.model_id,
+                    messages=messages,
+                    schema_model=PeerCritiquePayload,
+                    timeout_s=self.config.model_timeout_s,
+                    temperature=0.0,
+                    max_tokens=1100,
+                )
+                return seat, messages, payload, result, parse_error
+            except Exception as error:  # pragma: no cover - defensive branch
+                result = RemoteInferenceResult(
+                    status="error",
+                    text="",
+                    latency_ms=0.0,
+                    model_id=seat.model_id,
+                    error=str(error),
+                    parse_mode="hard_failure",
+                    parse_error_type="runtime_error",
+                    failure_is_hard=True,
+                    usable_contribution=False,
+                    usable_for_quorum=False,
+                )
+                return seat, messages, None, result, str(error)
+
+        async def _fan_out() -> list[
+            tuple[
+                CouncilSeat,
+                list[dict[str, str]],
+                Optional[PeerCritiquePayload],
+                RemoteInferenceResult,
+                Optional[str],
+            ]
+        ]:
+            tasks = [
+                _invoke_for_seat(seat, messages)
+                for seat, messages in work_items
+            ]
+            gathered = await asyncio.gather(*tasks, return_exceptions=True)
+            normalized: list[
+                tuple[
+                    CouncilSeat,
+                    list[dict[str, str]],
+                    Optional[PeerCritiquePayload],
+                    RemoteInferenceResult,
+                    Optional[str],
+                ]
+            ] = []
+            for item in gathered:
+                if isinstance(item, Exception):  # pragma: no cover - defensive branch
+                    self._record_runtime_failure(
+                        trace,
+                        f"Parallel peer critique task failed: {item}",
+                    )
+                    continue
+                normalized.append(item)
+            return normalized
+
+        succeeded = 0
+        failed = 0
+        for seat, messages, payload, result, parse_error in self._run_async(_fan_out()):
             self._record_transcript(
                 trace=trace,
                 stage=CouncilStage.PEER_CRITIQUE,
@@ -867,9 +1116,6 @@ class CouncilRuntime:
     ) -> list[RevisedAnswer]:
         answers_by_id = {answer.seat_id: answer for answer in initial_answers}
         revisions: list[RevisedAnswer] = []
-        attempted = 0
-        succeeded = 0
-        failed = 0
 
         received_by_seat: dict[str, list[dict[str, Any]]] = {}
         for critique in critiques:
@@ -882,26 +1128,108 @@ class CouncilRuntime:
                     }
                 )
 
+        work_items: list[tuple[CouncilSeat, dict[str, Any], list[dict[str, Any]]]] = []
         for seat in seats:
             original = answers_by_id.get(seat.seat_id)
             if original is None:
                 continue
-            attempted += 1
+            work_items.append(
+                (
+                    seat,
+                    original.model_dump(mode="json"),
+                    received_by_seat.get(seat.seat_id, []),
+                )
+            )
 
+        attempted = len(work_items)
+        if not work_items:
+            self._update_round_stats(
+                trace=trace,
+                stage=CouncilStage.REVISION,
+                attempted=0,
+                succeeded=0,
+                failed=0,
+            )
+            return []
+
+        async def _invoke_for_seat(
+            seat: CouncilSeat,
+            original_answer: dict[str, Any],
+            received_critiques: list[dict[str, Any]],
+        ) -> tuple[
+            CouncilSeat,
+            list[dict[str, str]],
+            Optional[RevisedAnswerPayload],
+            RemoteInferenceResult,
+            Optional[str],
+        ]:
             messages = build_revision_messages(
                 request=request,
                 seat=seat,
-                original_answer=original.model_dump(mode="json"),
-                received_critiques=received_by_seat.get(seat.seat_id, []),
+                original_answer=original_answer,
+                received_critiques=received_critiques,
             )
-            payload, result, parse_error = self.adapter.call_json(
-                model_id=seat.model_id,
-                messages=messages,
-                schema_model=RevisedAnswerPayload,
-                timeout_s=self.config.model_timeout_s,
-                temperature=0.15,
-                max_tokens=900,
-            )
+            try:
+                payload, result, parse_error = await self._call_adapter_json_async(
+                    model_id=seat.model_id,
+                    messages=messages,
+                    schema_model=RevisedAnswerPayload,
+                    timeout_s=self.config.model_timeout_s,
+                    temperature=0.15,
+                    max_tokens=900,
+                )
+                return seat, messages, payload, result, parse_error
+            except Exception as error:  # pragma: no cover - defensive branch
+                result = RemoteInferenceResult(
+                    status="error",
+                    text="",
+                    latency_ms=0.0,
+                    model_id=seat.model_id,
+                    error=str(error),
+                    parse_mode="hard_failure",
+                    parse_error_type="runtime_error",
+                    failure_is_hard=True,
+                    usable_contribution=False,
+                    usable_for_quorum=False,
+                )
+                return seat, messages, None, result, str(error)
+
+        async def _fan_out() -> list[
+            tuple[
+                CouncilSeat,
+                list[dict[str, str]],
+                Optional[RevisedAnswerPayload],
+                RemoteInferenceResult,
+                Optional[str],
+            ]
+        ]:
+            tasks = [
+                _invoke_for_seat(seat, original_answer, received_critiques)
+                for seat, original_answer, received_critiques in work_items
+            ]
+            gathered = await asyncio.gather(*tasks, return_exceptions=True)
+            normalized: list[
+                tuple[
+                    CouncilSeat,
+                    list[dict[str, str]],
+                    Optional[RevisedAnswerPayload],
+                    RemoteInferenceResult,
+                    Optional[str],
+                ]
+            ] = []
+            for item in gathered:
+                if isinstance(item, Exception):  # pragma: no cover - defensive branch
+                    self._record_runtime_failure(
+                        trace,
+                        f"Parallel revision task failed: {item}",
+                    )
+                    continue
+                normalized.append(item)
+            return normalized
+
+        succeeded = 0
+        failed = 0
+        for seat, messages, payload, result, parse_error in self._run_async(_fan_out()):
             self._record_transcript(
                 trace=trace,
                 stage=CouncilStage.REVISION,
@@ -980,7 +1308,7 @@ class CouncilRuntime:
                 revisions=[item.model_dump(mode="json") for item in revisions],
                 scorecards=[item.model_dump(mode="json") for item in trace.scorecards],
             )
-            payload, result, parse_error = self.adapter.call_json(
+            payload, result, parse_error = self._call_adapter_json(
                 model_id=chair.model_id,
                 messages=messages,
                 schema_model=FinalSynthesisPayload,
@@ -1191,6 +1519,14 @@ class CouncilRuntime:
     ) -> FailureFlag:
         if override_flag is not None:
             return override_flag
+        if result.status == "timeout":
+            return FailureFlag.TIMEOUT
+        if result.status == "unavailable":
+            return FailureFlag.UNAVAILABLE_MODEL
+        if result.status == "error":
+            if result.http_status is not None and result.http_status >= 500:
+                return FailureFlag.RUNTIME_ERROR
+            return FailureFlag.UNAVAILABLE_MODEL
         if parse_error:
             parse_error_type = (result.parse_error_type or "").strip().lower()
             if parse_error_type == "empty_response" or "empty response" in parse_error.lower():
@@ -1198,14 +1534,8 @@ class CouncilRuntime:
             if parse_error_type == "timeout":
                 return FailureFlag.TIMEOUT
             return FailureFlag.MALFORMED_JSON
-        if result.status == "timeout":
-            return FailureFlag.TIMEOUT
-        if result.status == "unavailable":
-            return FailureFlag.UNAVAILABLE_MODEL
         if result.status == "ok" and not result.text.strip():
             return FailureFlag.EMPTY_RESPONSE
-        if result.status == "error":
-            return FailureFlag.UNAVAILABLE_MODEL
         return FailureFlag.RUNTIME_ERROR
 
     def _record_runtime_failure(self, trace: CouncilRunTrace, detail: str) -> None:

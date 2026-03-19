@@ -27,3 +27,5 @@ output/
 # Secrets
 .env
 *.env.local
+python/rlrgf/hf_token.txt
+python/rlrgf/*.bak

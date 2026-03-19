@@ -14,10 +14,10 @@
   "escalation_confidence_threshold": 0.55,
   "model_ids": {
     "llama-3-8b": "meta-llama/Meta-Llama-3-8B-Instruct",
-    "gemma-7b": "google/gemma-1.1-7b-it",
-    "mistral-7b-v0.3": "mistralai/Mistral-7B-Instruct-v0.3",
-    "phi-3-mini": "microsoft/Phi-3-mini-4k-instruct",
-    "qwen-2-7b": "Qwen/Qwen2-7B-Instruct"
+    "gemma-7b": "google/gemma-3n-E4B-it",
+    "mistral-7b-v0.3": "google/gemma-3-27b-it",
+    "phi-3-mini": "Qwen/Qwen3-4B-Instruct-2507",
+    "qwen-2-7b": "Qwen/Qwen2.5-7B-Instruct"
   },
   "featured_prompts": [
     "Give an architecture recommendation for a secure RAG system in production.",

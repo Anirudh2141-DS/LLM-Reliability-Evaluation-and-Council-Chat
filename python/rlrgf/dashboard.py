@@ -1537,8 +1537,10 @@ def _dashboard_state_from_trace(
         "backend_type": trace.observability.backend_type,
         "failure_count": len(trace.failures),
         "failure_flags": sorted({failure.flag.value for failure in trace.failures}),
-        "latency_ms": trace.observability.total_latency_ms or total_latency,
+        "latency_ms": trace.observability.request_wall_time_ms or total_latency,
+        "request_wall_time_ms": trace.observability.request_wall_time_ms,
         "per_model_latency_ms": dict(trace.observability.per_model_latency_ms),
+        "stage_latency_ms": dict(trace.observability.stage_latency_ms),
     }
 
     return DashboardRuntimeState(
@@ -1553,7 +1555,7 @@ def _dashboard_state_from_trace(
         final_response_metadata=final_response_metadata,
         degraded_quorum=degraded_quorum,
         fallback_used=fallback_used,
-        total_latency_ms=total_latency,
+        total_latency_ms=trace.observability.request_wall_time_ms or total_latency,
         observability={
             "cache_status": trace.observability.cache_status.value,
             "execution_mode": trace.observability.execution_mode.value,
@@ -1563,8 +1565,10 @@ def _dashboard_state_from_trace(
             "number_of_models_failed": trace.observability.number_of_models_failed,
             "critique_enabled": trace.observability.critique_enabled,
             "backend_type": trace.observability.backend_type,
+            "request_wall_time_ms": trace.observability.request_wall_time_ms,
             "total_latency_ms": trace.observability.total_latency_ms,
             "per_model_latency_ms": dict(trace.observability.per_model_latency_ms),
+            "stage_latency_ms": dict(trace.observability.stage_latency_ms),
             "chair_selected_seat_id": trace.observability.chair_selected_seat_id,
             "chair_selected_model_id": trace.observability.chair_selected_model_id,
             "active_seat_ids": list(trace.observability.active_seat_ids),
@@ -1692,7 +1696,7 @@ def run_adaptive_council(
 ) -> tuple[DashboardRuntimeState, CouncilRunTrace]:
     initial_mode, selection_reason = _select_initial_mode(prompt, route)
     if benchmark_mode:
-        sequence = _mode_sequence(initial_mode)
+        sequence = [INFERENCE_MODE_FULL]
     else:
         sequence = [INFERENCE_MODE_SOLO] if initial_mode == INFERENCE_MODE_SOLO else [INFERENCE_MODE_PARTIAL]
     escalation_notes: list[str] = []
@@ -1861,6 +1865,9 @@ def render_turn_runtime_metadata(turn: dict[str, Any]) -> None:
     requested_models = metadata.get("number_of_models_requested", model_count)
     succeeded_models = metadata.get("number_of_models_succeeded")
     failed_models = metadata.get("number_of_models_failed")
+    stage_latency = observability.get("stage_latency_ms", {})
+    if not isinstance(stage_latency, dict):
+        stage_latency = {}
 
     st.caption(
         f"Mode: `{mode}` | Escalated: `{str(escalated).lower()}` | "
@@ -1879,6 +1886,14 @@ def render_turn_runtime_metadata(turn: dict[str, Any]) -> None:
         st.caption("Runtime note: quorum was degraded; output used partial council participation.")
     elif fallback_used:
         st.caption("Runtime note: fallback synthesis path was used to produce the final response.")
+    if stage_latency:
+        segments: list[str] = []
+        for name in ("initial_round", "critique", "revision", "aggregation"):
+            value = stage_latency.get(name)
+            if value is not None:
+                segments.append(f"{name} `{value}` ms")
+        if segments:
+            st.caption("Stage timing: " + " | ".join(segments))
 
 
 def render_live_model_performance(history_key: str):
@@ -1909,9 +1924,15 @@ def render_live_model_performance(history_key: str):
     execution_mode = str(observability.get("execution_mode", "unknown"))
     backend_type = str(observability.get("backend_type", "unknown"))
     critique_enabled = bool(observability.get("critique_enabled", False))
+    request_wall_time_ms = observability.get("request_wall_time_ms")
+    total_model_latency_ms = observability.get("total_latency_ms")
     st.caption(
         f"Execution lane: `{execution_mode}` | Backend: `{backend_type}` | Critique enabled: `{str(critique_enabled).lower()}`"
     )
+    if request_wall_time_ms is not None or total_model_latency_ms is not None:
+        st.caption(
+            f"Latency breakdown: request `{request_wall_time_ms}` ms | model-sum `{total_model_latency_ms}` ms"
+        )
 
     if runtime_state.get("degraded_quorum", False):
         st.warning(

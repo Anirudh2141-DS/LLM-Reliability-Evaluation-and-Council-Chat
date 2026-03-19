@@ -341,8 +341,10 @@ class RuntimeObservability(BaseModel):
     number_of_models_failed: int = Field(default=0, ge=0)
     critique_enabled: bool = False
     backend_type: str = "mock"
+    request_wall_time_ms: float = Field(default=0.0, ge=0.0)
     total_latency_ms: float = Field(default=0.0, ge=0.0)
     per_model_latency_ms: dict[str, float] = Field(default_factory=dict)
+    stage_latency_ms: dict[str, float] = Field(default_factory=dict)
     escalation_triggered: bool = False
     escalation_reason: Optional[str] = None
     chair_selected_seat_id: Optional[str] = None

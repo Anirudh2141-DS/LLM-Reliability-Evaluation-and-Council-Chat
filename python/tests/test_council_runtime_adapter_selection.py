@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from rlrgf.council_runtime import CouncilRuntime
-from rlrgf.council_runtime_config import CouncilRuntimeConfig
+from rlrgf.council_runtime_config import CouncilRuntimeConfig, HF_TOKEN_FILE_PATH
 from rlrgf.council_runtime_inference_adapter import (
     HuggingFaceRouterInferenceAdapter,
     MockCouncilInferenceAdapter,
@@ -45,7 +45,7 @@ def test_runtime_falls_back_to_mock_when_real_models_enabled_without_hf_token(
         api_key="",
         hf_token_found=False,
         hf_token_source="none",
-        hf_token_path=r"E:\MLOps\LLM Failure Evaluation Engine\python\rlrgf\hf_token.txt",
+        hf_token_path=str(HF_TOKEN_FILE_PATH),
         base_url="https://router.huggingface.co/v1",
         cache_path=str(tmp_path / "cache.json"),
     )

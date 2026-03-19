@@ -14,9 +14,7 @@ from .council_runtime_schemas import CouncilMode, CouncilSeat, ExecutionMode
 
 
 DEFAULT_COUNCIL_CONFIG_PATH = Path("config/council_models.json")
-HF_TOKEN_FILE_PATH = Path(
-    r"E:\MLOps\LLM Failure Evaluation Engine\python\rlrgf\hf_token.txt"
-)
+HF_TOKEN_FILE_PATH = Path(__file__).resolve().with_name("hf_token.txt")
 
 
 def _project_root() -> Path:
@@ -110,28 +108,28 @@ def default_seats() -> list[CouncilSeat]:
         CouncilSeat(
             seat_id="gemma-7b",
             role_title="Machine Learning Engineer",
-            model_id="google/gemma-1.1-7b-it",
+            model_id="google/gemma-3n-E4B-it",
             enabled_in_fast_mode=False,
             can_chair=True,
         ),
         CouncilSeat(
             seat_id="mistral-7b-v0.3",
             role_title="Software Performance Engineer",
-            model_id="mistralai/Mistral-7B-Instruct-v0.3",
+            model_id="google/gemma-3-27b-it",
             enabled_in_fast_mode=False,
             can_chair=True,
         ),
         CouncilSeat(
             seat_id="phi-3-mini",
             role_title="Technical Documentation Specialist",
-            model_id="microsoft/Phi-3-mini-4k-instruct",
+            model_id="Qwen/Qwen3-4B-Instruct-2507",
             enabled_in_fast_mode=True,
             can_chair=True,
         ),
         CouncilSeat(
             seat_id="qwen-2-7b",
             role_title="Security Compliance Officer",
-            model_id="Qwen/Qwen2-7B-Instruct",
+            model_id="Qwen/Qwen2.5-7B-Instruct",
             enabled_in_fast_mode=True,
             can_chair=True,
         ),

@@ -137,6 +137,33 @@ class _ScriptedAdapter:
         )
 
 
+class _HttpErrorAdapter(_ScriptedAdapter):
+    def call_json(
+        self,
+        *,
+        model_id: str,
+        messages: list[dict[str, str]],
+        schema_model: type[BaseModel],
+        timeout_s: float,
+        temperature: float = 0.2,
+        max_tokens: int = 900,
+    ) -> tuple[Optional[BaseModel], RemoteInferenceResult, Optional[str]]:
+        _ = (messages, timeout_s, temperature, max_tokens, schema_model)
+        self.calls.append((schema_model.__name__, model_id))
+        result = RemoteInferenceResult(
+            status="error",
+            text="",
+            latency_ms=15.0,
+            model_id=model_id,
+            error=(
+                f"HTTP 400: {{\"error\":{{\"message\":\"The requested model '{model_id}' "
+                "is not supported by any provider you have enabled.\"}}}}"
+            ),
+            http_status=400,
+        )
+        return None, result, result.error
+
+
 def _runtime_config(cache_path: Path) -> CouncilRuntimeConfig:
     return CouncilRuntimeConfig(
         base_url="http://unit-test.local",
@@ -304,6 +331,19 @@ def test_empty_model_response_is_classified_as_empty_response(tmp_path: Path) ->
     assert any(
         failure.stage == CouncilStage.INITIAL_ANSWER
         and failure.flag == FailureFlag.EMPTY_RESPONSE
+        for failure in trace.failures
+    )
+
+
+def test_http_400_model_support_error_is_classified_as_unavailable_model(
+    tmp_path: Path,
+) -> None:
+    adapter = _HttpErrorAdapter()
+    trace = _run(tmp_path, mode=CouncilMode.FULL_COUNCIL, adapter=adapter)
+
+    assert any(
+        failure.stage == CouncilStage.INITIAL_ANSWER
+        and failure.flag == FailureFlag.UNAVAILABLE_MODEL
         for failure in trace.failures
     )
 

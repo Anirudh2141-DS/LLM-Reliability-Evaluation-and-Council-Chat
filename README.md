@@ -94,12 +94,18 @@ cd python
 # Fast mode council run
 python -m rlrgf.run_council_runtime --query "How should we secure a production RAG stack?" --mode fast
 
+# Interactive lane: lean path, minimal seats, no heavy critique by default
+python -m rlrgf.run_council_runtime --query "How should we secure a production RAG stack?" --mode fast --execution-mode interactive
+
+# Benchmark lane: strict full council with full diagnostics
+python -m rlrgf.run_council_runtime --query "How should we secure a production RAG stack?" --mode full --execution-mode benchmark
+
 # Full trace JSON for debugging/integration
 python -m rlrgf.run_council_runtime --query "How should we secure a production RAG stack?" --mode full --json
 
 # Force real Hugging Face router calls
 # Place Hugging Face token in:
-# E:\MLOps\LLM Failure Evaluation Engine\python\rlrgf\hf_token.txt
+# python\rlrgf\hf_token.txt
 cd rlrgf
 python run_council_runtime.py "Explain exponential backoff" --use-real-models
 ```
@@ -109,13 +115,16 @@ Runtime endpoint settings can be provided with:
 - `COUNCIL_API_BASE_URL`
 - `COUNCIL_API_KEY`
 - `COUNCIL_MODEL_<SEAT_ID>` for per-seat model overrides (example: `COUNCIL_MODEL_LLAMA_3_8B`)
-- `HF_TOKEN` (used as fallback only when `E:\MLOps\LLM Failure Evaluation Engine\python\rlrgf\hf_token.txt` is missing)
+- `HF_TOKEN` (used as fallback only when `python\rlrgf\hf_token.txt` is missing)
 - `COUNCIL_USE_REAL_MODELS` (`true`/`false` switch)
+- `COUNCIL_EXECUTION_MODE` (`interactive` or `benchmark`)
 
 Adapter behavior:
 
 - default/offline path uses `MockCouncilInferenceAdapter`
 - real path uses `HuggingFaceRouterInferenceAdapter` against `https://router.huggingface.co/v1`
+- checked-in council seat defaults in `config/council_models.json` are aligned to router-validated chat-capable models for the current provider account; use `COUNCIL_MODEL_<SEAT_ID>` to override per seat
+- live runtime uses async network calls for initial, critique, revision, and synthesis stages; the sync adapter API remains for compatibility only
 - CLI prints selected adapter, `remote_requests`, token-found status, token source, and base URL (never token value)
 
 Smoke harness:
@@ -125,6 +134,9 @@ cd python
 .venv\Scripts\activate
 
 python -m rlrgf.run_council_runtime_smoke --modes fast,full --prompt-pack ..\config\council_smoke_prompts.json
+
+# Benchmark-only smoke validation
+python -m rlrgf.run_council_runtime_smoke --modes full --execution-mode benchmark --prompt-pack ..\config\council_smoke_prompts.json
 
 # Optional: force real router calls for smoke runs
 python -m rlrgf.run_council_runtime_smoke --modes fast,full --prompt-pack ..\config\council_smoke_prompts.json --use-real-models
@@ -149,6 +161,28 @@ Key reliability guarantees:
 - scorecard build failures degrade gracefully into valid fallback scorecards
 - cache entries are schema-versioned to avoid stale contract reuse
 - `force_live_rerun` bypasses cache reads
+
+Key observability fields:
+
+- `request_wall_time_ms`: end-to-end wall-clock runtime for the request
+- `total_latency_ms`: model-sum latency across transcript events; this can exceed wall-clock latency when fan-out is parallel
+- `stage_latency_ms`: wall-clock breakdown for `initial_round`, `critique`, `revision`, and `aggregation`
+- `number_of_models_requested`, `number_of_models_succeeded`, `number_of_models_failed`: quorum-relevant seat outcomes
+- `critique_enabled`: `true` only when a critique stage actually ran
+- `backend_type`: `mock` or `remote`
+- `quorum_success`: whether the active lane met quorum after failures/degradation
+
+Token loading and safety:
+
+- `python\rlrgf\hf_token.txt` is repo-local and gitignored
+- if the file is absent, `HF_TOKEN` is used instead
+- token values are never printed by the CLI or dashboard telemetry
+
+Live-network caveat:
+
+- router/provider support is model-dependent; unsupported models surface as `unavailable_model`
+- benchmark runs can degrade if one or more configured seats are unsupported by the current provider account
+- use `number_of_models_failed`, `failure_flags`, and `stage_latency_ms` to distinguish provider-support failures from latency or parsing problems
 
 ## Pre-Dashboard Status
 
