@@ -182,6 +182,7 @@ Live-network caveat:
 
 - router/provider support is model-dependent; unsupported models surface as `unavailable_model`
 - benchmark runs can degrade if one or more configured seats are unsupported by the current provider account
+- provider credit exhaustion can surface as `HTTP 402` during live runs; treat that as an external account-limit condition rather than a council runtime defect
 - use `number_of_models_failed`, `failure_flags`, and `stage_latency_ms` to distinguish provider-support failures from latency or parsing problems
 
 ## Pre-Dashboard Status
@@ -200,6 +201,12 @@ Still intentionally pending before UI wiring:
 - dashboard integration onto this runtime contract
 - UI mapping for observability/round stats surfaces
 - UX decisions for degraded quorum and fallback messaging
+
+Experimental foundation:
+
+- the repository now also includes a non-default agentic runtime foundation under `python/rlrgf/`
+- this path is opt-in, conservative, and bounded; it is not the current dashboard/demo execution path
+- the Streamlit dashboard remains evaluation-first and continues to use the stable council runtime by default
 
 ### 4. Start Rust API Server
 

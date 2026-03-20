@@ -144,6 +144,8 @@ class CouncilRuntimeConfig:
     hf_token_source: str = "none"
     hf_token_path: str = str(HF_TOKEN_FILE_PATH)
     use_real_models: bool = False
+    agentic_enabled: bool = False
+    execution_strategy: str = "standard"
     default_execution_mode: ExecutionMode = ExecutionMode.BENCHMARK
     hf_router_base_url: str = "https://router.huggingface.co/v1"
     request_timeout_s: float = 45.0
@@ -155,7 +157,10 @@ class CouncilRuntimeConfig:
     escalation_confidence_threshold: float = 0.55
     fast_quorum: int = 2
     full_quorum: int = 3
+    max_iterations: int = 3
     enable_revision_round: bool = True
+    verification_enabled: bool = True
+    retrieval_retry_limit: int = 1
     benchmark_enable_pairwise_critique: bool = False
     benchmark_enable_summary_review: bool = True
     interactive_max_models: int = 2
@@ -232,6 +237,14 @@ def load_runtime_config(config_path: Optional[str] = None) -> CouncilRuntimeConf
     cfg.backup_chair_seat_id = str(
         raw.get("backup_chair_seat_id", cfg.backup_chair_seat_id)
     )
+    cfg.agentic_enabled = _coerce_bool(
+        raw.get("agentic_enabled", cfg.agentic_enabled),
+        cfg.agentic_enabled,
+    )
+    execution_strategy = str(
+        raw.get("execution_strategy", cfg.execution_strategy)
+    ).strip().lower()
+    cfg.execution_strategy = "agentic" if execution_strategy == "agentic" else "standard"
     cfg.enable_revision_round = _coerce_bool(
         raw.get("enable_revision_round", cfg.enable_revision_round),
         cfg.enable_revision_round,
@@ -340,6 +353,29 @@ def load_runtime_config(config_path: Optional[str] = None) -> CouncilRuntimeConf
         cfg.full_quorum,
         minimum=1,
     )
+    cfg.max_iterations = _coerce_int(
+        raw.get("max_iterations", cfg.max_iterations),
+        cfg.max_iterations,
+        minimum=1,
+    )
+    cfg.verification_enabled = _coerce_bool(
+        raw.get("verification_enabled", cfg.verification_enabled),
+        cfg.verification_enabled,
+    )
+    cfg.retrieval_retry_limit = _coerce_int(
+        raw.get("retrieval_retry_limit", cfg.retrieval_retry_limit),
+        cfg.retrieval_retry_limit,
+        minimum=0,
+    )
+    cfg.escalation_disagreement_threshold = _coerce_float(
+        raw.get(
+            "disagreement_escalation_threshold",
+            cfg.escalation_disagreement_threshold,
+        ),
+        cfg.escalation_disagreement_threshold,
+        minimum=0.0,
+        maximum=1.0,
+    )
 
     hf_token, hf_token_source = _load_hf_token()
     cfg.hf_token_found = bool(hf_token)
@@ -375,6 +411,17 @@ def load_runtime_config(config_path: Optional[str] = None) -> CouncilRuntimeConf
         cfg.default_execution_mode = ExecutionMode.INTERACTIVE
     elif env_execution_mode == ExecutionMode.BENCHMARK.value:
         cfg.default_execution_mode = ExecutionMode.BENCHMARK
+    env_execution_strategy = os.getenv("COUNCIL_EXECUTION_STRATEGY", "").strip().lower()
+    if env_execution_strategy == "agentic":
+        cfg.execution_strategy = "agentic"
+    elif env_execution_strategy == "standard":
+        cfg.execution_strategy = "standard"
+    env_agentic_enabled = os.getenv("COUNCIL_AGENTIC_ENABLED")
+    if env_agentic_enabled is not None:
+        cfg.agentic_enabled = _coerce_bool(
+            env_agentic_enabled,
+            cfg.agentic_enabled,
+        )
 
     # Per-seat env override: COUNCIL_MODEL_<SEAT_ID>.
     env_map: dict[str, str] = {}

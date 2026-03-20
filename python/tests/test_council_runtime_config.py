@@ -177,3 +177,35 @@ def test_load_runtime_config_parses_execution_mode_and_critique_flags(
     assert loaded.interactive_prefer_remote is True
     assert loaded.interactive_disable_cpu_fallback is True
     assert loaded.interactive_skip_heavy_probe is True
+
+
+def test_load_runtime_config_defaults_agentic_path_to_disabled(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        runtime_config_module, "HF_TOKEN_FILE_PATH", tmp_path / "missing_hf_token.txt"
+    )
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    config_path = tmp_path / "council_models.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "agentic_enabled": False,
+                "execution_strategy": "standard",
+                "max_iterations": 3,
+                "verification_enabled": True,
+                "retrieval_retry_limit": 2,
+                "disagreement_escalation_threshold": 0.7,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_runtime_config(str(config_path))
+
+    assert loaded.agentic_enabled is False
+    assert loaded.execution_strategy == "standard"
+    assert loaded.max_iterations == 3
+    assert loaded.verification_enabled is True
+    assert loaded.retrieval_retry_limit == 2
+    assert loaded.escalation_disagreement_threshold == 0.7

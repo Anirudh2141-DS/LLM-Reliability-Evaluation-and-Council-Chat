@@ -4,11 +4,14 @@ Live multi-round council runtime orchestration.
 
 from __future__ import annotations
 
+import ast
 import asyncio
+from dataclasses import asdict, is_dataclass
 from hashlib import sha256
 import json
 import logging
 from pathlib import Path
+import re
 from statistics import mean
 import time
 from typing import Any, Optional
@@ -64,10 +67,177 @@ from .council_runtime_schemas import (
 logger = logging.getLogger(__name__)
 
 CACHE_SCHEMA_VERSION = 3
+_ANSWER_FIELD_NAMES = (
+    "final_answer",
+    "answer",
+    "revised_answer",
+    "content",
+    "text",
+)
+_INTERNAL_ANSWER_MARKERS = (
+    "finalsynthesispayload",
+    "finalsynthesis(",
+    "dashboardruntimestate(",
+    "modeltelemetrystate(",
+    "runtimeobservability(",
+    "councilruntrace(",
+)
+_SCHEMA_WRAPPER_KEYS = {
+    "$defs",
+    "definitions",
+    "description",
+    "properties",
+    "required",
+    "title",
+    "type",
+}
 
 
 def _clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
     return max(low, min(high, value))
+
+
+def _parse_structured_text(value: str) -> Any:
+    cleaned = (value or "").strip()
+    if not cleaned:
+        return None
+    if cleaned[0] not in {'{', '[', '"', "'"}:
+        return None
+    for loader in (json.loads, ast.literal_eval):
+        try:
+            return loader(cleaned)
+        except (ValueError, SyntaxError, json.JSONDecodeError, TypeError):
+            continue
+    return None
+
+
+def _mapping_looks_like_schema(mapping: dict[str, Any]) -> bool:
+    keys = {str(key).strip().lower() for key in mapping}
+    if not keys:
+        return False
+    if "properties" in keys and "type" in keys:
+        return True
+    return keys.issubset(_SCHEMA_WRAPPER_KEYS)
+
+
+def _extract_user_visible_answer_candidate(value: Any, *, depth: int = 0) -> str:
+    if value is None or depth > 6:
+        return ""
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if not cleaned:
+            return ""
+        structured = _parse_structured_text(cleaned)
+        if structured is not None and structured != cleaned:
+            nested = _extract_user_visible_answer_candidate(structured, depth=depth + 1)
+            if nested:
+                return nested
+        return cleaned
+    if hasattr(value, "model_dump") and callable(value.model_dump):
+        return _extract_user_visible_answer_candidate(
+            value.model_dump(mode="python"),
+            depth=depth + 1,
+        )
+    if is_dataclass(value) and not isinstance(value, type):
+        return _extract_user_visible_answer_candidate(asdict(value), depth=depth + 1)
+    if isinstance(value, dict):
+        for key in _ANSWER_FIELD_NAMES:
+            if key in value:
+                return _extract_user_visible_answer_candidate(
+                    value[key],
+                    depth=depth + 1,
+                )
+        if _mapping_looks_like_schema(value):
+            return ""
+        return ""
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            nested = _extract_user_visible_answer_candidate(item, depth=depth + 1)
+            if nested:
+                return nested
+        return ""
+    for attr in _ANSWER_FIELD_NAMES:
+        if hasattr(value, attr):
+            return _extract_user_visible_answer_candidate(
+                getattr(value, attr),
+                depth=depth + 1,
+            )
+    return str(value).strip()
+
+
+def is_invalid_user_visible_answer_text(value: str) -> bool:
+    cleaned = (value or "").strip()
+    if not cleaned:
+        return True
+    lowered = cleaned.lower()
+    if any(marker in lowered for marker in _INTERNAL_ANSWER_MARKERS):
+        return True
+    if re.match(r"^[A-Z][A-Za-z0-9_]*(Payload|State|Trace|Result|Observability)\(", cleaned):
+        return True
+    structured = _parse_structured_text(cleaned)
+    if isinstance(structured, dict):
+        if _mapping_looks_like_schema(structured):
+            return True
+        keys = {str(key).strip().lower() for key in structured}
+        payload_like_keys = {
+            "chair_model_id",
+            "chair_seat_id",
+            "confidence",
+            "fallback_used",
+            "final_answer",
+            "latency_ms",
+            "reasoning_summary",
+            "strongest_contributors",
+            "uncertainty_notes",
+            "winner_seat_ids",
+        }
+        if "final_answer" in keys and keys.issubset(payload_like_keys):
+            return True
+    return False
+
+
+def normalize_user_visible_answer_text(value: Any) -> str:
+    candidate = _extract_user_visible_answer_candidate(value)
+    cleaned = candidate.replace("\r\n", "\n").strip()
+    if is_invalid_user_visible_answer_text(cleaned):
+        return ""
+    return cleaned
+
+
+def trace_all_active_seats_unavailable(trace: CouncilRunTrace) -> bool:
+    active_seat_ids = {seat.seat_id for seat in trace.active_seats}
+    if not active_seat_ids:
+        return False
+    requested = trace.observability.number_of_models_requested or len(active_seat_ids)
+    if requested <= 0:
+        return False
+    if trace.observability.number_of_models_succeeded > 0:
+        return False
+    unavailable_seats = {
+        failure.seat_id
+        for failure in trace.failures
+        if failure.seat_id in active_seat_ids
+        and failure.flag == FailureFlag.UNAVAILABLE_MODEL
+    }
+    if unavailable_seats != active_seat_ids:
+        return False
+    usable_seat_ids = {
+        answer.seat_id for answer in trace.initial_answers if answer.seat_id in active_seat_ids
+    }
+    usable_seat_ids.update(
+        answer.seat_id for answer in trace.revised_answers if answer.seat_id in active_seat_ids
+    )
+    return not usable_seat_ids
+
+
+def _short_numeric_answer_conflict(primary: str, secondary: str) -> bool:
+    primary_numbers = re.findall(r"\b\d+(?:\.\d+)?\b", primary)
+    secondary_numbers = re.findall(r"\b\d+(?:\.\d+)?\b", secondary)
+    if not primary_numbers or not secondary_numbers:
+        return False
+    if primary_numbers == secondary_numbers:
+        return False
+    return len(primary.split()) <= 20 and len(secondary.split()) <= 20
 
 
 class CouncilRuntime:
@@ -1283,12 +1453,14 @@ class CouncilRuntime:
     ) -> FinalSynthesis:
         if not initial_answers:
             return self._fallback_synthesis(
+                request=request,
                 trace=trace,
                 chair=chairs[0] if chairs else None,
                 reason="No initial answers available for synthesis.",
             )
         if not chairs:
             return self._fallback_synthesis(
+                request=request,
                 trace=trace,
                 chair=None,
                 reason="No chair candidate available for synthesis.",
@@ -1299,8 +1471,7 @@ class CouncilRuntime:
         failed = 0
         seat_ids = {seat.seat_id for seat in trace.active_seats}
         for chair in chairs:
-            attempted += 1
-            messages = build_synthesis_messages(
+            base_messages = build_synthesis_messages(
                 request=request,
                 chair=chair,
                 initial_answers=[item.model_dump(mode="json") for item in initial_answers],
@@ -1308,67 +1479,95 @@ class CouncilRuntime:
                 revisions=[item.model_dump(mode="json") for item in revisions],
                 scorecards=[item.model_dump(mode="json") for item in trace.scorecards],
             )
-            payload, result, parse_error = self._call_adapter_json(
-                model_id=chair.model_id,
-                messages=messages,
-                schema_model=FinalSynthesisPayload,
-                timeout_s=self.config.model_timeout_s,
-                temperature=0.1,
-                max_tokens=1300,
-            )
-            self._record_transcript(
-                trace=trace,
-                stage=CouncilStage.SYNTHESIS,
-                seat=chair,
-                messages=messages,
-                result=result,
-                parse_error=parse_error,
-            )
-            if payload is None:
+            messages = list(base_messages)
+            for attempt_index in range(2):
+                attempted += 1
+                payload, result, parse_error = self._call_adapter_json(
+                    model_id=chair.model_id,
+                    messages=messages,
+                    schema_model=FinalSynthesisPayload,
+                    timeout_s=self.config.model_timeout_s,
+                    temperature=0.1,
+                    max_tokens=1300,
+                )
+                self._record_transcript(
+                    trace=trace,
+                    stage=CouncilStage.SYNTHESIS,
+                    seat=chair,
+                    messages=messages,
+                    result=result,
+                    parse_error=parse_error,
+                )
+                if payload is None:
+                    failed += 1
+                    self._record_failure(
+                        trace=trace,
+                        stage=CouncilStage.SYNTHESIS,
+                        seat=chair,
+                        result=result,
+                        parse_error=parse_error,
+                        override_flag=FailureFlag.SYNTHESIS_FAILURE,
+                    )
+                    break
+
+                normalized_answer = normalize_user_visible_answer_text(payload.final_answer)
+                normalized_reasoning = normalize_user_visible_answer_text(
+                    payload.reasoning_summary
+                ) or payload.reasoning_summary.strip()
+                if normalized_answer:
+                    succeeded += 1
+                    winner_ids = [
+                        seat_id
+                        for seat_id in dict.fromkeys(payload.winner_seat_ids)
+                        if seat_id in seat_ids
+                    ]
+                    contributor_ids = [
+                        seat_id
+                        for seat_id in dict.fromkeys(payload.strongest_contributors)
+                        if seat_id in seat_ids
+                    ]
+                    trace.observability.chair_selected_seat_id = chair.seat_id
+                    trace.observability.chair_selected_model_id = chair.model_id
+                    self._update_round_stats(
+                        trace=trace,
+                        stage=CouncilStage.SYNTHESIS,
+                        attempted=attempted,
+                        succeeded=succeeded,
+                        failed=failed,
+                    )
+                    return self._finalize_synthesis_output(
+                        request=request,
+                        trace=trace,
+                        synthesis=FinalSynthesis(
+                            chair_seat_id=chair.seat_id,
+                            chair_model_id=chair.model_id,
+                            final_answer=normalized_answer,
+                            reasoning_summary=normalized_reasoning
+                            or "Synthesis completed from available council outputs.",
+                            winner_seat_ids=winner_ids,
+                            strongest_contributors=contributor_ids,
+                            uncertainty_notes=list(payload.uncertainty_notes),
+                            cited_risk_notes=list(payload.cited_risk_notes),
+                            confidence=_clamp(payload.confidence),
+                            fallback_used=False,
+                            latency_ms=result.latency_ms,
+                        ),
+                    )
+
+                if attempt_index == 0:
+                    messages = self._synthesis_retry_messages(base_messages)
+                    continue
+
                 failed += 1
                 self._record_failure(
                     trace=trace,
                     stage=CouncilStage.SYNTHESIS,
                     seat=chair,
                     result=result,
-                    parse_error=parse_error,
+                    parse_error="Invalid synthesis output exposed internal payload content.",
                     override_flag=FailureFlag.SYNTHESIS_FAILURE,
                 )
-                continue
-
-            succeeded += 1
-            winner_ids = [
-                seat_id
-                for seat_id in dict.fromkeys(payload.winner_seat_ids)
-                if seat_id in seat_ids
-            ]
-            contributor_ids = [
-                seat_id
-                for seat_id in dict.fromkeys(payload.strongest_contributors)
-                if seat_id in seat_ids
-            ]
-            trace.observability.chair_selected_seat_id = chair.seat_id
-            trace.observability.chair_selected_model_id = chair.model_id
-            self._update_round_stats(
-                trace=trace,
-                stage=CouncilStage.SYNTHESIS,
-                attempted=attempted,
-                succeeded=succeeded,
-                failed=failed,
-            )
-            return FinalSynthesis(
-                chair_seat_id=chair.seat_id,
-                chair_model_id=chair.model_id,
-                final_answer=payload.final_answer,
-                reasoning_summary=payload.reasoning_summary,
-                winner_seat_ids=winner_ids,
-                strongest_contributors=contributor_ids,
-                uncertainty_notes=list(payload.uncertainty_notes),
-                cited_risk_notes=list(payload.cited_risk_notes),
-                confidence=_clamp(payload.confidence),
-                fallback_used=False,
-                latency_ms=result.latency_ms,
-            )
+                break
 
         self._update_round_stats(
             trace=trace,
@@ -1378,6 +1577,7 @@ class CouncilRuntime:
             failed=failed,
         )
         return self._fallback_synthesis(
+            request=request,
             trace=trace,
             chair=chairs[0],
             reason="All chair synthesis attempts failed.",
@@ -1386,39 +1586,35 @@ class CouncilRuntime:
     def _fallback_synthesis(
         self,
         *,
+        request: CouncilRequest,
         trace: CouncilRunTrace,
         chair: Optional[CouncilSeat],
         reason: str,
     ) -> FinalSynthesis:
-        initial_by_seat = {item.seat_id: item for item in trace.initial_answers}
-        revised_by_seat = {item.seat_id: item for item in trace.revised_answers}
-        best = rank_best_answer(trace.scorecards)
-        if best is not None:
-            revised = revised_by_seat.get(best.seat_id)
-            initial = initial_by_seat.get(best.seat_id)
-            final_answer = (
-                revised.revised_answer
-                if revised is not None
-                else (initial.answer if initial is not None else "")
-            )
-            reasoning = (
-                "Fallback synthesis selected the highest-ranked available seat answer."
-            )
-            winner_ids = [best.seat_id]
-            confidence = _clamp(best.confidence)
+        final_answer, winner_ids, confidence = self._best_available_answer_text(trace)
+        if final_answer:
+            reasoning = "Fallback synthesis selected the highest-ranked available seat answer."
+        elif trace_all_active_seats_unavailable(trace):
+            final_answer = self._provider_unavailable_message(request.execution_mode)
+            reasoning = "No model seats were available to complete the requested run."
+            confidence = 0.0
+            winner_ids = []
         else:
             final_answer = (
                 "Council could not produce a reliable synthesis. Please retry with full council."
             )
             reasoning = "Fallback synthesis had no available model outputs to select from."
-            winner_ids = []
             confidence = 0.0
+            winner_ids = []
 
         if chair is not None:
             trace.observability.chair_selected_seat_id = chair.seat_id
             trace.observability.chair_selected_model_id = chair.model_id
 
-        return FinalSynthesis(
+        return self._finalize_synthesis_output(
+            request=request,
+            trace=trace,
+            synthesis=FinalSynthesis(
             chair_seat_id=chair.seat_id if chair is not None else self.config.chair_seat_id,
             chair_model_id=chair.model_id if chair is not None else "",
             final_answer=final_answer,
@@ -1430,6 +1626,136 @@ class CouncilRuntime:
             confidence=confidence,
             fallback_used=True,
             latency_ms=None,
+            ),
+        )
+
+    def _best_available_answer_text(
+        self,
+        trace: CouncilRunTrace,
+    ) -> tuple[str, list[str], float]:
+        initial_by_seat = {item.seat_id: item for item in trace.initial_answers}
+        revised_by_seat = {item.seat_id: item for item in trace.revised_answers}
+
+        ordered_seat_ids: list[str] = []
+        best = rank_best_answer(trace.scorecards)
+        if best is not None:
+            ordered_seat_ids.append(best.seat_id)
+        ordered_seat_ids.extend(seat.seat_id for seat in trace.active_seats)
+        ordered_seat_ids.extend(item.seat_id for item in trace.initial_answers)
+
+        seen: set[str] = set()
+        for seat_id in ordered_seat_ids:
+            if seat_id in seen:
+                continue
+            seen.add(seat_id)
+            revised = revised_by_seat.get(seat_id)
+            initial = initial_by_seat.get(seat_id)
+            candidate = normalize_user_visible_answer_text(
+                revised.revised_answer if revised is not None else None
+            )
+            if not candidate:
+                candidate = normalize_user_visible_answer_text(
+                    initial.answer if initial is not None else None
+                )
+            if not candidate:
+                continue
+            confidence = 0.0
+            if revised is not None:
+                confidence = _clamp(revised.confidence)
+            elif initial is not None:
+                confidence = _clamp(initial.confidence)
+            elif best is not None and best.seat_id == seat_id:
+                confidence = _clamp(best.confidence)
+            return candidate, [seat_id], confidence
+        return "", [], 0.0
+
+    def _provider_unavailable_message(self, execution_mode: ExecutionMode) -> str:
+        if execution_mode == ExecutionMode.BENCHMARK:
+            return (
+                "Benchmark execution could not complete because no model seats were available. "
+                "Please retry when provider capacity is available."
+            )
+        return (
+            "Interactive execution could not complete because no model seats were available. "
+            "Please retry when provider capacity is available."
+        )
+
+    def _synthesis_retry_messages(
+        self,
+        messages: list[dict[str, str]],
+    ) -> list[dict[str, str]]:
+        retry_messages = list(messages)
+        retry_messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "Your previous response exposed internal schema or wrapper content. "
+                    "Return only a clean user-facing answer and concise reasoning summary "
+                    "in the required JSON structure."
+                ),
+            }
+        )
+        return retry_messages
+
+    def _finalize_synthesis_output(
+        self,
+        *,
+        request: CouncilRequest,
+        trace: CouncilRunTrace,
+        synthesis: FinalSynthesis,
+    ) -> FinalSynthesis:
+        final_answer = normalize_user_visible_answer_text(synthesis.final_answer)
+        reasoning_summary = normalize_user_visible_answer_text(
+            synthesis.reasoning_summary
+        ) or synthesis.reasoning_summary.strip()
+
+        if (
+            request.execution_mode == ExecutionMode.INTERACTIVE
+            and len(trace.active_seats) == 1
+            and trace.initial_answers
+        ):
+            direct_answer = normalize_user_visible_answer_text(trace.initial_answers[0].answer)
+            if direct_answer and _short_numeric_answer_conflict(
+                direct_answer,
+                final_answer,
+            ):
+                final_answer = direct_answer
+
+        if not final_answer:
+            best_answer, best_winners, best_confidence = self._best_available_answer_text(trace)
+            if best_answer:
+                return synthesis.model_copy(
+                    update={
+                        "final_answer": best_answer,
+                        "reasoning_summary": (
+                            reasoning_summary
+                            or "Fallback synthesis selected the best available seat answer."
+                        ),
+                        "winner_seat_ids": best_winners,
+                        "strongest_contributors": best_winners,
+                        "confidence": best_confidence,
+                        "fallback_used": True,
+                    }
+                )
+            if trace_all_active_seats_unavailable(trace):
+                return synthesis.model_copy(
+                    update={
+                        "final_answer": self._provider_unavailable_message(
+                            request.execution_mode
+                        ),
+                        "reasoning_summary": "No model seats were available to complete the requested run.",
+                        "winner_seat_ids": [],
+                        "strongest_contributors": [],
+                        "confidence": 0.0,
+                        "fallback_used": True,
+                    }
+                )
+
+        return synthesis.model_copy(
+            update={
+                "final_answer": final_answer or synthesis.final_answer.strip(),
+                "reasoning_summary": reasoning_summary or "Synthesis completed.",
+            }
         )
 
     def _record_transcript(

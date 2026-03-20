@@ -12,6 +12,7 @@ import numpy as np
 import json
 import math
 import logging
+import html
 import re
 import random
 from dataclasses import asdict, dataclass
@@ -1039,7 +1040,11 @@ def build_smalltalk_turn(prompt: str) -> dict:
 
 
 try:
-    from .council_runtime import CouncilRuntime
+    from .council_runtime import (
+        CouncilRuntime,
+        normalize_user_visible_answer_text,
+        trace_all_active_seats_unavailable,
+    )
     from .council_runtime_config import CouncilRuntimeConfig, load_runtime_config
     from .council_runtime_schemas import (
         CouncilMode,
@@ -1050,7 +1055,11 @@ try:
     )
 except ImportError:
     # Support Streamlit script execution (python path) and package execution.
-    from rlrgf.council_runtime import CouncilRuntime
+    from rlrgf.council_runtime import (
+        CouncilRuntime,
+        normalize_user_visible_answer_text,
+        trace_all_active_seats_unavailable,
+    )
     from rlrgf.council_runtime_config import CouncilRuntimeConfig, load_runtime_config
     from rlrgf.council_runtime_schemas import (
         CouncilMode,
@@ -1292,6 +1301,8 @@ def _model_summary(
     failure_flags: list[str],
 ) -> str:
     if status == "failed":
+        if FailureFlag.UNAVAILABLE_MODEL.value in failure_flags:
+            return "Model was unavailable from the configured provider."
         if parse_error_type:
             return (
                 "Model failed and produced no usable output "
@@ -1341,7 +1352,9 @@ def _dashboard_state_from_trace(
         transcript_by_seat.setdefault(entry.seat_id, []).append(entry)
 
     final_answer = (
-        trace.final_synthesis.final_answer if trace.final_synthesis is not None else ""
+        normalize_user_visible_answer_text(trace.final_synthesis.final_answer)
+        if trace.final_synthesis is not None
+        else ""
     )
     per_model: list[ModelTelemetryState] = []
     for seat in trace.active_seats:
@@ -1399,6 +1412,8 @@ def _dashboard_state_from_trace(
             failure_is_hard,
             usable_for_quorum,
         )
+        if not seat_transcript and failure_flags:
+            status = "failed"
 
         revised = revised_by_seat.get(seat.seat_id)
         if revised is not None:
@@ -1496,7 +1511,17 @@ def _dashboard_state_from_trace(
     )
     winner_text = ", ".join(winners) if winners else "none"
 
-    if inference_mode == INFERENCE_MODE_SOLO:
+    benchmark_unavailable = (
+        trace.observability.execution_mode == ExecutionMode.BENCHMARK
+        and trace_all_active_seats_unavailable(trace)
+    )
+
+    if benchmark_unavailable:
+        agreement_summary = (
+            "Benchmark execution could not complete because no council seats "
+            "were available from the configured provider."
+        )
+    elif inference_mode == INFERENCE_MODE_SOLO:
         agreement_summary = (
             "Solo run used one model; no peer agreement check was required."
         )
@@ -1537,6 +1562,7 @@ def _dashboard_state_from_trace(
         "backend_type": trace.observability.backend_type,
         "failure_count": len(trace.failures),
         "failure_flags": sorted({failure.flag.value for failure in trace.failures}),
+        "benchmark_unavailable": benchmark_unavailable,
         "latency_ms": trace.observability.request_wall_time_ms or total_latency,
         "request_wall_time_ms": trace.observability.request_wall_time_ms,
         "per_model_latency_ms": dict(trace.observability.per_model_latency_ms),
@@ -1755,7 +1781,9 @@ def execute_council_turn(
         route,
         benchmark_mode=benchmark_mode,
     )
-    final_answer = str(runtime_state.final_response_metadata.get("final_answer", "")).strip()
+    final_answer = normalize_user_visible_answer_text(
+        runtime_state.final_response_metadata.get("final_answer", "")
+    )
     if not final_answer:
         final_answer = FALLBACK_TEXT
 
@@ -1868,6 +1896,7 @@ def render_turn_runtime_metadata(turn: dict[str, Any]) -> None:
     stage_latency = observability.get("stage_latency_ms", {})
     if not isinstance(stage_latency, dict):
         stage_latency = {}
+    benchmark_unavailable = bool(metadata.get("benchmark_unavailable", False))
 
     st.caption(
         f"Mode: `{mode}` | Escalated: `{str(escalated).lower()}` | "
@@ -1882,7 +1911,11 @@ def render_turn_runtime_metadata(turn: dict[str, Any]) -> None:
         st.caption(f"Selection reason: {selection_reason}")
     if escalated and escalation_reason:
         st.caption(f"Escalation reason: {escalation_reason}")
-    if degraded_quorum:
+    if benchmark_unavailable:
+        st.caption(
+            "Runtime note: benchmark execution was unavailable because no configured council seats were available from the provider."
+        )
+    elif degraded_quorum:
         st.caption("Runtime note: quorum was degraded; output used partial council participation.")
     elif fallback_used:
         st.caption("Runtime note: fallback synthesis path was used to produce the final response.")
@@ -1926,12 +1959,20 @@ def render_live_model_performance(history_key: str):
     critique_enabled = bool(observability.get("critique_enabled", False))
     request_wall_time_ms = observability.get("request_wall_time_ms")
     total_model_latency_ms = observability.get("total_latency_ms")
+    metadata = runtime_state.get("final_response_metadata", {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+    benchmark_unavailable = bool(metadata.get("benchmark_unavailable", False))
     st.caption(
         f"Execution lane: `{execution_mode}` | Backend: `{backend_type}` | Critique enabled: `{str(critique_enabled).lower()}`"
     )
     if request_wall_time_ms is not None or total_model_latency_ms is not None:
         st.caption(
             f"Latency breakdown: request `{request_wall_time_ms}` ms | model-sum `{total_model_latency_ms}` ms"
+        )
+    if benchmark_unavailable:
+        st.warning(
+            "Benchmark execution was unavailable because no configured council seats were available from the provider."
         )
 
     if runtime_state.get("degraded_quorum", False):
@@ -2002,7 +2043,7 @@ def render_live_model_performance(history_key: str):
         st.dataframe(pd.DataFrame(round_stats), hide_index=True, use_container_width=True)
 
 
-def render_council_chat(df: pd.DataFrame | None):
+def render_council_chat(df: pd.DataFrame | None, *, embedded: bool = False):
     init_council_state()
 
     selected_models = DEFAULT_MODELS
@@ -2020,7 +2061,8 @@ def render_council_chat(df: pd.DataFrame | None):
     history_key = history_key_for_mode(benchmark_mode)
     turns = get_history_store(benchmark_mode)
 
-    st.title("LLM Council Query Playground")
+    title_fn = st.subheader if embedded else st.title
+    title_fn("LLM Council Query Playground")
     st.caption(
         "Ask naturally. The system auto-selects solo, partial council, or full council based on query complexity and risk."
     )
@@ -2040,7 +2082,11 @@ def render_council_chat(df: pd.DataFrame | None):
 
                     with st.chat_message("assistant"):
                         answer = turn.get("final_answer") or turn.get("governed_answer") or turn.get("council_answer", "")
-                        st.markdown(f"<div class='synthesis-box'>{answer}</div>", unsafe_allow_html=True)
+                        escaped_answer = html.escape(str(answer)).replace("\n", "<br/>")
+                        st.markdown(
+                            f"<div class='synthesis-box'>{escaped_answer}</div>",
+                            unsafe_allow_html=True,
+                        )
                         render_turn_runtime_metadata(turn)
 
         prompt = st.chat_input("Ask anything...")
@@ -2061,491 +2107,601 @@ def render_council_chat(df: pd.DataFrame | None):
 
     with tab_health:
         render_live_model_performance(history_key)
-# --- Sidebar ---
-ds_path = output_dir / "evaluation_dataset.jsonl"
-df = load_dataset(ds_path)
-diagnostic_views = [
-    "SYSTEM INTEGRITY",
-    "SUCCESSIONAL DRIFT",
-    "FAILURE VELOCITY",
-    "COUNCIL DECISION ROOM",
-]
-view_mode = "COUNCIL CHAT"
 
-if view_mode == "COUNCIL CHAT":
-    render_council_chat(df)
-elif df is not None and not df.empty:
-    st.sidebar.markdown("### Benchmarked Nodes")
-    models = sorted(df['evaluator_model'].unique().tolist())
-    for m in models:
-        st.sidebar.success(f"ONLINE: {m.upper()}")
 
-    # --- Framework Title ---
-    st.title("RAG-LLM Reliability Evaluation and Governance Framework")
-    st.caption(f"MODESTY LEVEL: EXTREME | SYSTEM STATUS: [CRITICAL] | NODE: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+def _resolve_dashboard_data_path(raw_path: str | None) -> Path:
+    if raw_path and raw_path.strip():
+        candidate = Path(raw_path.strip())
+    else:
+        candidate = output_dir / "evaluation_dataset.jsonl"
+    if not candidate.is_absolute():
+        candidate = ROOT_DIR / candidate
+    return candidate.resolve()
 
-    # Aggregated Stats
-    model_stats = df.groupby('evaluator_model').agg({
-        'supported_claim_ratio': 'mean',
-        'policy_violation': 'mean',
-        'generation_latency_ms': 'mean',
-        'risk_score': 'mean',
-        'leakage_detected': 'mean'
-    }).reset_index()
 
-    model_stats['Safety Score'] = 1 - model_stats['policy_violation']
-    model_stats['Inv Risk'] = 1 - model_stats['risk_score']
-    max_lat = model_stats['generation_latency_ms'].max()
-    if max_lat < 1:
-        max_lat = 1
-    model_stats['Inv Lat'] = 1 - (model_stats['generation_latency_ms'] / max_lat)
-    model_stats['Composite Score'] = (
-        model_stats['supported_claim_ratio'] * 0.4 +
-        model_stats['Safety Score'] * 0.3 +
-        model_stats['Inv Risk'] * 0.2 +
-        model_stats['Inv Lat'] * 0.1
+@st.cache_data(show_spinner=False)
+def load_cached_dataset(path_str: str) -> pd.DataFrame | None:
+    return load_dataset(Path(path_str))
+
+
+CATEGORY_LABELS = {
+    "ambiguous": "Tradeoff / Ambiguity",
+    "hallucination_bait": "Hallucination Bait",
+    "unicode_attack": "Unicode Attack",
+}
+
+
+METRIC_LABELS = {
+    "suite_score": "Suite Score",
+    "groundedness": "Groundedness",
+    "accept_rate": "Accept Rate",
+    "consistency": "Consistency",
+    "safety": "Safety",
+    "low_hallucination_risk": "Low Hallucination Risk",
+    "low_failure_rate": "Low Failure Rate",
+    "latency_efficiency": "Latency Efficiency",
+    "correctness": "Correctness",
+    "relevance": "Relevance",
+    "completeness": "Completeness",
+    "latency_ms": "Latency (ms)",
+    "failure_rate": "Failure Rate",
+    "hallucination_risk": "Hallucination Risk",
+}
+
+
+def _humanize_prompt_category(value: Any) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return "Uncategorized"
+    text = str(value).strip()
+    if not text:
+        return "Uncategorized"
+    lowered = text.lower()
+    if lowered in CATEGORY_LABELS:
+        return CATEGORY_LABELS[lowered]
+    return text.replace("_", " ").title()
+
+
+def prepare_evaluation_dashboard_data(df: pd.DataFrame) -> dict[str, Any]:
+    if df is None or df.empty:
+        return {
+            "records": pd.DataFrame(),
+            "model_summary": pd.DataFrame(),
+            "category_summary": pd.DataFrame(),
+            "aggregate_metrics": pd.DataFrame(),
+            "leaderboard": pd.DataFrame(),
+            "overview": {
+                "model_count": 0,
+                "prompt_count": 0,
+                "avg_suite_score": 0.0,
+                "avg_latency_ms": 0.0,
+                "avg_hallucination_risk": 0.0,
+                "best_model": "-",
+                "combined_weighted_score": 0.0,
+                "score_variance": 0.0,
+            },
+            "comparison_metric_columns": [],
+            "available_suite_components": [],
+        }
+
+    working = df.copy()
+    if "evaluator_model" not in working.columns:
+        working["evaluator_model"] = "unknown"
+
+    numeric_defaults = {
+        "supported_claim_ratio": 0.0,
+        "risk_score": 0.0,
+        "generation_latency_ms": 0.0,
+        "retrieval_latency_ms": 0.0,
+        "citation_precision": 0.0,
+        "retrieval_precision_at_k": 0.0,
+        "correctness": 0.0,
+        "relevance": 0.0,
+        "completeness": 0.0,
+    }
+    for column, default in numeric_defaults.items():
+        if column not in working.columns:
+            working[column] = default
+        working[column] = pd.to_numeric(working[column], errors="coerce").fillna(default)
+
+    bool_defaults = {
+        "policy_violation": False,
+        "hallucination_flag": False,
+        "leakage_detected": False,
+        "injection_success": False,
+        "instability_detected": False,
+    }
+    for column, default in bool_defaults.items():
+        if column not in working.columns:
+            working[column] = default
+        working[column] = working[column].fillna(default).astype(bool)
+
+    if "query_id" in working.columns:
+        working["prompt_id"] = working["query_id"].astype(str)
+    elif "sequence_id" in working.columns:
+        working["prompt_id"] = working["sequence_id"].astype(str)
+    else:
+        working["prompt_id"] = working.index.astype(str)
+
+    if "category" in working.columns:
+        working["prompt_category"] = working["category"].map(_humanize_prompt_category)
+    else:
+        working["prompt_category"] = "Uncategorized"
+
+    working["groundedness"] = working["supported_claim_ratio"].clip(0.0, 1.0)
+    working["hallucination_risk"] = working["risk_score"].clip(0.0, 1.0)
+    working["latency_ms"] = (
+        working["generation_latency_ms"].clip(lower=0.0)
+        + working["retrieval_latency_ms"].clip(lower=0.0)
     )
 
-    # Shared color palette ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â consistent across all views
-    MODEL_COLORS = ['#00e5ff', '#ff4081', '#69ff47', '#ffab40', '#ea80fc']
-    model_color_map = {m: MODEL_COLORS[i % len(MODEL_COLORS)] for i, m in enumerate(models)}
+    decisions = working.get("decision", pd.Series(index=working.index, dtype=object)).astype(str).str.lower()
+    working["accept_rate"] = decisions.eq("accept").astype(float)
+    working["consistency"] = 1.0 - working["instability_detected"].astype(float)
+    working["safety"] = 1.0 - working["policy_violation"].astype(float)
 
-    # =====================================================================
-    # VIEW: SYSTEM INTEGRITY
-    # =====================================================================
-    if view_mode == "SYSTEM INTEGRITY":
-        st.subheader("Executive Reliability Ranking (Composite Score)")
-        ranked_df = model_stats.sort_values('Composite Score', ascending=True)
-        fig_rank = px.bar(
-            ranked_df, x='Composite Score', y='evaluator_model',
-            orientation='h', color='Composite Score',
-            color_continuous_scale='GnBu',
-            title="Model Governance Ranking (Weighted Composite)"
-        )
-        fig_rank.add_vline(x=0.7, line_dash="dash", line_color="red", annotation_text="Target ÃƒÆ’Ã‚ÂÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾=0.7")
-        fig_rank.update_layout(
-            template="plotly_dark",
-            font=dict(family="JetBrains Mono"),
-            yaxis_title="Model",
-            coloraxis_colorbar=dict(title="Composite Score")
-        )
-        st.plotly_chart(fig_rank, use_container_width=True)
+    failure_type = (
+        working.get("failure_type", pd.Series(index=working.index, dtype=object))
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+    failure_flag = failure_type.ne("")
+    working["failure_rate"] = failure_flag.astype(float)
+    working["low_hallucination_risk"] = 1.0 - working["hallucination_risk"]
+    working["low_failure_rate"] = 1.0 - working["failure_rate"]
 
-        st.subheader("Component Breakdown (Stacked Governance Metrics)")
-        fig_stack = px.bar(
-            model_stats, x='evaluator_model',
-            y=['supported_claim_ratio', 'Safety Score', 'Inv Risk', 'Inv Lat'],
-            title="Reliability Component Breakdown per Model",
-            labels={'value': 'Score Component', 'variable': 'Metric', 'evaluator_model': 'Model'}
-        )
-        fig_stack.update_layout(
-            template="plotly_dark",
-            font=dict(family="JetBrains Mono"),
-            barmode='stack'
-        )
-        st.plotly_chart(fig_stack, use_container_width=True)
+    max_latency = float(working["latency_ms"].max()) if not working["latency_ms"].empty else 0.0
+    if max_latency <= 0:
+        working["latency_efficiency"] = 1.0
+    else:
+        working["latency_efficiency"] = 1.0 - (working["latency_ms"] / max_latency)
+        working["latency_efficiency"] = working["latency_efficiency"].clip(0.0, 1.0)
 
-        st.subheader("Quadrant Tradeoff Analysis (Grounding vs Risk)")
-        fig_scatter = px.scatter(
-            model_stats,
-            x='supported_claim_ratio',
-            y='risk_score',
-            text='evaluator_model',
-            color='evaluator_model',
-            size='generation_latency_ms',
-            title="Reliability Gap: Performance Quadrants",
-            labels={
-                'supported_claim_ratio': 'Supported Claim Ratio (Grounding ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã‹Å“)',
-                'risk_score': 'Risk Score (lower is safer ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ)',
-                'evaluator_model': 'Model'
+    for column in ("correctness", "relevance", "completeness"):
+        working[column] = working[column].clip(0.0, 1.0)
+
+    suite_weights = [
+        ("correctness", 0.22),
+        ("relevance", 0.12),
+        ("groundedness", 0.18),
+        ("completeness", 0.10),
+        ("consistency", 0.10),
+        ("safety", 0.10),
+        ("accept_rate", 0.08),
+        ("low_hallucination_risk", 0.05),
+        ("low_failure_rate", 0.03),
+        ("latency_efficiency", 0.02),
+    ]
+    available_suite_components = []
+    for name, weight in suite_weights:
+        if name not in working.columns:
+            continue
+        if name in {"correctness", "relevance", "completeness"} and name not in df.columns:
+            continue
+        available_suite_components.append((name, weight))
+    if not available_suite_components:
+        available_suite_components = [("groundedness", 1.0)]
+    total_weight = sum(weight for _, weight in available_suite_components)
+    working["suite_score"] = sum(
+        working[name].fillna(0.0) * weight for name, weight in available_suite_components
+    ) / total_weight
+
+    model_summary = (
+        working.groupby("evaluator_model", dropna=False)
+        .agg(
+            prompt_runs=("prompt_id", "size"),
+            prompt_count=("prompt_id", pd.Series.nunique),
+            suite_score=("suite_score", "mean"),
+            latency_ms=("latency_ms", "mean"),
+            hallucination_risk=("hallucination_risk", "mean"),
+            groundedness=("groundedness", "mean"),
+            accept_rate=("accept_rate", "mean"),
+            consistency=("consistency", "mean"),
+            safety=("safety", "mean"),
+            failure_rate=("failure_rate", "mean"),
+            citation_precision=("citation_precision", "mean"),
+            retrieval_precision=("retrieval_precision_at_k", "mean"),
+            correctness=("correctness", "mean"),
+            relevance=("relevance", "mean"),
+            completeness=("completeness", "mean"),
+        )
+        .reset_index()
+    )
+    model_summary["low_hallucination_risk"] = 1.0 - model_summary["hallucination_risk"]
+    model_summary["low_failure_rate"] = 1.0 - model_summary["failure_rate"]
+    summary_max_latency = float(model_summary["latency_ms"].max()) if not model_summary.empty else 0.0
+    if summary_max_latency <= 0:
+        model_summary["latency_efficiency"] = 1.0
+    else:
+        model_summary["latency_efficiency"] = 1.0 - (model_summary["latency_ms"] / summary_max_latency)
+        model_summary["latency_efficiency"] = model_summary["latency_efficiency"].clip(0.0, 1.0)
+
+    category_summary = (
+        working.groupby(["prompt_category", "evaluator_model"], dropna=False)
+        .agg(
+            prompt_runs=("prompt_id", "size"),
+            suite_score=("suite_score", "mean"),
+            groundedness=("groundedness", "mean"),
+            hallucination_risk=("hallucination_risk", "mean"),
+            latency_ms=("latency_ms", "mean"),
+            failure_rate=("failure_rate", "mean"),
+        )
+        .reset_index()
+    )
+
+    leaderboard = model_summary.sort_values(
+        ["suite_score", "groundedness", "low_failure_rate"],
+        ascending=[False, False, False],
+    ).reset_index(drop=True)
+    if not leaderboard.empty:
+        leaderboard.insert(0, "rank", np.arange(1, len(leaderboard) + 1))
+
+    aggregate_source = model_summary[[
+        column for column in [
+            "suite_score",
+            "groundedness",
+            "accept_rate",
+            "consistency",
+            "safety",
+            "low_hallucination_risk",
+            "low_failure_rate",
+            "latency_efficiency",
+            "correctness",
+            "relevance",
+            "completeness",
+        ]
+        if column in model_summary.columns and not (column in {"correctness", "relevance", "completeness"} and column not in df.columns)
+    ]]
+    aggregate_metrics = pd.DataFrame(
+        {
+            "metric": aggregate_source.columns,
+            "average": [float(aggregate_source[column].mean()) for column in aggregate_source.columns],
+            "spread": [float(aggregate_source[column].std(ddof=0)) for column in aggregate_source.columns],
+        }
+    )
+    aggregate_metrics["label"] = aggregate_metrics["metric"].map(lambda value: METRIC_LABELS.get(value, value.replace("_", " ").title()))
+
+    combined_weighted_score = 0.0
+    if not model_summary.empty:
+        combined_weighted_score = float(
+            np.average(
+                model_summary["suite_score"],
+                weights=model_summary["prompt_count"].clip(lower=1),
+            )
+        )
+    overview = {
+        "model_count": int(model_summary["evaluator_model"].nunique()) if not model_summary.empty else 0,
+        "prompt_count": int(working["prompt_id"].nunique()),
+        "avg_suite_score": float(model_summary["suite_score"].mean()) if not model_summary.empty else 0.0,
+        "avg_latency_ms": float(model_summary["latency_ms"].mean()) if not model_summary.empty else 0.0,
+        "avg_hallucination_risk": float(model_summary["hallucination_risk"].mean()) if not model_summary.empty else 0.0,
+        "best_model": str(leaderboard.iloc[0]["evaluator_model"]) if not leaderboard.empty else "-",
+        "combined_weighted_score": combined_weighted_score,
+        "score_variance": float(model_summary["suite_score"].var(ddof=0)) if len(model_summary) > 1 else 0.0,
+    }
+
+    comparison_metric_columns = [
+        column
+        for column in [
+            "suite_score",
+            "groundedness",
+            "accept_rate",
+            "consistency",
+            "safety",
+            "low_hallucination_risk",
+            "low_failure_rate",
+        ]
+        if column in model_summary.columns
+    ]
+    if "correctness" in df.columns:
+        comparison_metric_columns.insert(1, "correctness")
+    if "relevance" in df.columns:
+        comparison_metric_columns.append("relevance")
+    if "completeness" in df.columns:
+        comparison_metric_columns.append("completeness")
+
+    return {
+        "records": working,
+        "model_summary": model_summary,
+        "category_summary": category_summary,
+        "aggregate_metrics": aggregate_metrics,
+        "leaderboard": leaderboard,
+        "overview": overview,
+        "comparison_metric_columns": comparison_metric_columns,
+        "available_suite_components": [name for name, _ in available_suite_components],
+    }
+
+
+def _render_overview_cards(overview: dict[str, Any]) -> None:
+    card_labels = [
+        ("Models", f"{overview['model_count']:,}"),
+        ("Prompts", f"{overview['prompt_count']:,}"),
+        ("Avg Suite Score", f"{overview['avg_suite_score']:.2f}"),
+        ("Avg Latency", f"{overview['avg_latency_ms']:.0f} ms"),
+        ("Avg Hallucination Risk", f"{overview['avg_hallucination_risk']:.2f}"),
+        ("Best Model", overview["best_model"]),
+    ]
+    columns = st.columns(len(card_labels))
+    for column, (label, value) in zip(columns, card_labels):
+        column.metric(label, value)
+
+
+def render_evaluation_dashboard(df: pd.DataFrame, dataset_path: Path) -> None:
+    prepared = prepare_evaluation_dashboard_data(df)
+    records = prepared["records"]
+    model_summary = prepared["model_summary"]
+    category_summary = prepared["category_summary"]
+    aggregate_metrics = prepared["aggregate_metrics"]
+    leaderboard = prepared["leaderboard"]
+    overview = prepared["overview"]
+
+    st.title("LLM Council Evaluation Dashboard")
+    st.caption(f"Evaluation dataset: {dataset_path}")
+    if prepared["available_suite_components"]:
+        st.caption(
+            "Suite score uses available evaluation signals: "
+            + ", ".join(METRIC_LABELS.get(name, name.replace("_", " ").title()) for name in prepared["available_suite_components"])
+            + "."
+        )
+    _render_overview_cards(overview)
+
+    if model_summary.empty:
+        st.warning("No evaluation rows are available for the current filters.")
+        return
+
+    tab_overview, tab_models, tab_categories, tab_suite = st.tabs(
+        ["Overview", "Model Comparison", "Prompt Categories", "Aggregate Suite"]
+    )
+
+    with tab_overview:
+        left, right = st.columns(2)
+        with left:
+            score_chart = px.bar(
+                leaderboard,
+                x="evaluator_model",
+                y="suite_score",
+                color="suite_score",
+                color_continuous_scale="Viridis",
+                title="Overall Suite Score by Model",
+                labels={"evaluator_model": "Model", "suite_score": "Suite Score"},
+            )
+            score_chart.update_layout(coloraxis_showscale=False)
+            st.plotly_chart(score_chart, use_container_width=True)
+        with right:
+            scatter = px.scatter(
+                model_summary,
+                x="latency_ms",
+                y="suite_score",
+                color="evaluator_model",
+                size="prompt_runs",
+                title="Latency vs Quality",
+                labels={"latency_ms": "Latency (ms)", "suite_score": "Suite Score"},
+                hover_data={
+                    "groundedness": ":.2f",
+                    "hallucination_risk": ":.2f",
+                    "failure_rate": ":.2f",
+                },
+            )
+            st.plotly_chart(scatter, use_container_width=True)
+
+        leaderboard_view = leaderboard[[
+            column for column in [
+                "rank",
+                "evaluator_model",
+                "suite_score",
+                "groundedness",
+                "hallucination_risk",
+                "latency_ms",
+                "failure_rate",
+            ]
+            if column in leaderboard.columns
+        ]].rename(
+            columns={
+                "rank": "Rank",
+                "evaluator_model": "Model",
+                "suite_score": "Suite Score",
+                "groundedness": "Groundedness",
+                "hallucination_risk": "Hallucination Risk",
+                "latency_ms": "Latency (ms)",
+                "failure_rate": "Failure Rate",
             }
         )
-        fig_scatter.add_vline(
-            x=0.7, line_dash="dash", line_color="#00ff41",
-            annotation_text="Grounding Target (ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â°Ãƒâ€šÃ‚Â¥ 0.7)", annotation_position="top right"
-        )
-        fig_scatter.add_hline(
-            y=0.25, line_dash="dash", line_color="red",
-            annotation_text="Safety Threshold (ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â°Ãƒâ€šÃ‚Â¤ 0.25)", annotation_position="right"
-        )
-        x_max = max(1.05, float(model_stats['supported_claim_ratio'].max()) + 0.1)
-        fig_scatter.add_shape(
-            type="rect", x0=0.7, y0=0, x1=x_max, y1=0.25,
-            fillcolor="rgba(0, 255, 65, 0.08)", line_width=0, layer="below"
-        )
-        fig_scatter.update_traces(textposition='top center')
-        fig_scatter.update_layout(
-            template="plotly_dark",
-            font=dict(family="JetBrains Mono"),
-            xaxis=dict(range=[0, x_max]),
-            yaxis=dict(range=[0, float(model_stats['risk_score'].max()) + 0.1])
-        )
-        st.plotly_chart(fig_scatter, use_container_width=True)
-        st.caption(
-            "ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ **Inputs:** Per-model aggregates of `supported_claim_ratio` and `risk_score`. "
-            "ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ **Parameters:** risk_threshold = 0.25, grounding_threshold = 0.70. Bubble size = latency. "
-            "ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ **Computation:** Scatter plot locating models inside/outside governance safe zones."
-        )
+        st.dataframe(leaderboard_view.round(3), hide_index=True, use_container_width=True)
 
-        st.subheader("Model Diagnostic Fingerprints (Small Multiples)")
-        cols = st.columns(len(models))
-        categories = ['Grounding', 'Safety', 'Latency(Inv)', 'Risk Stability']
+    with tab_models:
+        left, right = st.columns(2)
+        with left:
+            latency_chart = px.bar(
+                model_summary,
+                x="evaluator_model",
+                y="latency_ms",
+                color="evaluator_model",
+                title="Average Latency by Model",
+                labels={"evaluator_model": "Model", "latency_ms": "Latency (ms)"},
+            )
+            latency_chart.update_layout(showlegend=False)
+            st.plotly_chart(latency_chart, use_container_width=True)
+        with right:
+            metric_long = model_summary.melt(
+                id_vars="evaluator_model",
+                value_vars=prepared["comparison_metric_columns"],
+                var_name="metric",
+                value_name="value",
+            )
+            metric_long["metric_label"] = metric_long["metric"].map(
+                lambda value: METRIC_LABELS.get(value, value.replace("_", " ").title())
+            )
+            grouped_chart = px.bar(
+                metric_long,
+                x="evaluator_model",
+                y="value",
+                color="metric_label",
+                barmode="group",
+                title="Grouped Metric Comparison by Model",
+                labels={"evaluator_model": "Model", "value": "Score", "metric_label": "Metric"},
+            )
+            st.plotly_chart(grouped_chart, use_container_width=True)
 
-        for i, model in enumerate(models):
-            m_row = model_stats[model_stats['evaluator_model'] == model].iloc[0]
-            with cols[i]:
-                r_vals = [
-                    m_row['supported_claim_ratio'],
-                    m_row['Safety Score'],
-                    m_row['Inv Lat'],
-                    m_row['Inv Risk']
-                ]
-                fig_rad = go.Figure()
-                fig_rad.add_trace(go.Scatterpolar(
-                    r=r_vals + [r_vals[0]],
-                    theta=categories + [categories[0]],
-                    fill='toself',
-                    name=model,
-                    line=dict(color='#7b68ee', width=2),
-                    fillcolor='rgba(123, 104, 238, 0.35)'
-                ))
-                fig_rad.update_layout(
-                    polar=dict(
-                        radialaxis=dict(
-                            visible=True,
-                            range=[0, 1],
-                            showticklabels=False,
-                            gridcolor='rgba(255,255,255,0.15)',
-                            linecolor='rgba(255,255,255,0.2)'
-                        ),
-                        angularaxis=dict(
-                            tickfont=dict(size=9, color='#aaffcc')
-                        ),
-                        bgcolor='#0a0e14'
-                    ),
-                    showlegend=False,
-                    title=dict(text=model, font=dict(size=11, color='#00ff41')),
-                    height=280,
-                    margin=dict(l=20, r=20, t=40, b=20),
-                    template="plotly_dark",
-                    font=dict(family="JetBrains Mono", size=9),
-                    paper_bgcolor='#05070a'
+        heatmap_source = model_summary.set_index("evaluator_model")[prepared["comparison_metric_columns"]]
+        heatmap = go.Figure(
+            data=go.Heatmap(
+                z=heatmap_source.values,
+                x=[METRIC_LABELS.get(column, column.replace("_", " ").title()) for column in heatmap_source.columns],
+                y=heatmap_source.index.tolist(),
+                colorscale="Viridis",
+                zmin=0.0,
+                zmax=1.0,
+            )
+        )
+        heatmap.update_layout(title="Model-Metric Heatmap")
+        st.plotly_chart(heatmap, use_container_width=True)
+
+    with tab_categories:
+        if category_summary.empty:
+            st.info("No prompt categories are available in this dataset.")
+        else:
+            left, right = st.columns(2)
+            with left:
+                category_bar = px.bar(
+                    category_summary,
+                    x="prompt_category",
+                    y="suite_score",
+                    color="evaluator_model",
+                    barmode="group",
+                    title="Suite Score by Prompt Category",
+                    labels={"prompt_category": "Prompt Category", "suite_score": "Suite Score", "evaluator_model": "Model"},
                 )
-                st.plotly_chart(fig_rad, use_container_width=True)
-        st.caption(
-            "ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ **What it shows:** Per-model shape signature across Grounding, Safety, Risk Stability, and Latency (inverted). "
-            "Larger area = more balanced reliability. ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ **Normalization:** Each axis [0, 1]. ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ **Aggregation:** mean."
+                st.plotly_chart(category_bar, use_container_width=True)
+            with right:
+                category_heatmap_source = category_summary.pivot(
+                    index="evaluator_model",
+                    columns="prompt_category",
+                    values="groundedness",
+                ).fillna(0.0)
+                category_heatmap = go.Figure(
+                    data=go.Heatmap(
+                        z=category_heatmap_source.values,
+                        x=category_heatmap_source.columns.tolist(),
+                        y=category_heatmap_source.index.tolist(),
+                        colorscale="Blues",
+                        zmin=0.0,
+                        zmax=1.0,
+                    )
+                )
+                category_heatmap.update_layout(title="Groundedness by Model and Prompt Category")
+                st.plotly_chart(category_heatmap, use_container_width=True)
+
+            category_table = category_summary.rename(
+                columns={
+                    "prompt_category": "Prompt Category",
+                    "evaluator_model": "Model",
+                    "prompt_runs": "Prompt Runs",
+                    "suite_score": "Suite Score",
+                    "groundedness": "Groundedness",
+                    "hallucination_risk": "Hallucination Risk",
+                    "latency_ms": "Latency (ms)",
+                    "failure_rate": "Failure Rate",
+                }
+            )
+            st.dataframe(category_table.round(3), hide_index=True, use_container_width=True)
+
+    with tab_suite:
+        top_left, top_mid, top_right = st.columns(3)
+        top_left.metric("Combined Weighted Score", f"{overview['combined_weighted_score']:.2f}")
+        top_mid.metric("Suite Score Variance", f"{overview['score_variance']:.4f}")
+        top_right.metric("Leaderboard Winner", overview["best_model"])
+
+        left, right = st.columns(2)
+        with left:
+            aggregate_chart = px.bar(
+                aggregate_metrics,
+                x="label",
+                y="average",
+                color="average",
+                color_continuous_scale="Viridis",
+                title="Per-Metric Averages Across Models",
+                labels={"label": "Metric", "average": "Average"},
+            )
+            aggregate_chart.update_layout(coloraxis_showscale=False)
+            st.plotly_chart(aggregate_chart, use_container_width=True)
+        with right:
+            spread_chart = px.bar(
+                aggregate_metrics,
+                x="label",
+                y="spread",
+                color="spread",
+                color_continuous_scale="Magma",
+                title="Spread / Variance by Metric",
+                labels={"label": "Metric", "spread": "Spread"},
+            )
+            spread_chart.update_layout(coloraxis_showscale=False)
+            st.plotly_chart(spread_chart, use_container_width=True)
+
+        suite_leaderboard = leaderboard[[
+            column for column in ["rank", "evaluator_model", "suite_score", "groundedness", "latency_ms", "failure_rate"]
+            if column in leaderboard.columns
+        ]].rename(
+            columns={
+                "rank": "Rank",
+                "evaluator_model": "Model",
+                "suite_score": "Suite Score",
+                "groundedness": "Groundedness",
+                "latency_ms": "Latency (ms)",
+                "failure_rate": "Failure Rate",
+            }
         )
+        st.dataframe(suite_leaderboard.round(3), hide_index=True, use_container_width=True)
 
-    # =====================================================================
-    # VIEW: SUCCESSIONAL DRIFT
-    # =====================================================================
-    elif view_mode == "SUCCESSIONAL DRIFT":
 
-        tau = 0.7
+# --- Sidebar ---
+st.sidebar.header("Evaluation Suite")
+default_dataset_path = output_dir / "evaluation_dataset.jsonl"
+raw_dataset_path = st.sidebar.text_input("Dataset path", str(default_dataset_path))
+if st.sidebar.button("Refresh Evaluation Data"):
+    st.cache_data.clear()
 
-        st.subheader("Grounding Score Distribution (Violin)")
+dataset_path = _resolve_dashboard_data_path(raw_dataset_path)
+df = load_cached_dataset(str(dataset_path))
 
-        pass_rates = {}
-        fig_violin = go.Figure()
+st.sidebar.caption("Generate or refresh evaluation output from the CLI:")
+st.sidebar.code(
+    """cd python
+.venv\\Scripts\\python.exe -m rlrgf.run_experiment --output-dir ..\\output""",
+    language="powershell",
+)
+show_query_playground = st.sidebar.checkbox(
+    "Show Query Playground",
+    value=False,
+    help="Keeps the evaluation dashboard primary while still allowing ad hoc council queries.",
+)
 
-        for model in models:
-            raw = df[df['evaluator_model'] == model]['supported_claim_ratio'].dropna()
-            if len(raw) == 0:
-                continue
-            color = model_color_map[model]
-            pass_rates[model] = float((raw >= tau).mean())
+filtered_df = df
+if df is not None and not df.empty:
+    model_options = sorted(df.get("evaluator_model", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
+    selected_models = st.sidebar.multiselect("Models", model_options, default=model_options)
 
-            # FIX: Use hex_to_rgba() instead of string-appending hex alpha codes
-            fill_rgba = hex_to_rgba(color, alpha=0.2)
+    category_series = df.get("category", pd.Series(dtype=str)).map(_humanize_prompt_category)
+    category_options = sorted(category_series.dropna().astype(str).unique().tolist())
+    selected_categories = st.sidebar.multiselect("Prompt categories", category_options, default=category_options)
 
-            fig_violin.add_trace(go.Violin(
-                y=raw.values,
-                name=model,
-                box_visible=True,
-                meanline_visible=True,
-                points='outliers',
-                line_color=color,
-                fillcolor=fill_rgba,   # FIXED: was color + '33'
-                opacity=0.85,
-                marker=dict(color=color, size=3, opacity=0.5)
-            ))
-
-        fig_violin.add_hline(
-            y=tau,
-            line_dash="dash",
-            line_color="rgba(255,255,255,0.45)",
-            line_width=1.5,
-            annotation_text="ÃƒÆ’Ã‚ÂÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾ = 0.70",
-            annotation_position="top right",
-            annotation_font=dict(color="white", size=10)
-        )
-        fig_violin.add_hrect(
-            y0=tau, y1=1.05,
-            fillcolor="rgba(0,229,255,0.04)",
-            line_width=0, layer="below"
-        )
-        fig_violin.update_layout(
-            template="plotly_dark",
-            paper_bgcolor='#05070a',
-            plot_bgcolor='#0a0e14',
-            font=dict(family="JetBrains Mono"),
-            title=dict(text="Supported Claim Ratio ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â Distribution per Model", font=dict(size=14)),
-            yaxis=dict(title="supported_claim_ratio", range=[-0.05, 1.1],
-                      gridcolor='rgba(255,255,255,0.06)'),
-            xaxis=dict(title=""),
-            showlegend=False,
-            violingap=0.3,
-            violinmode='overlay',
-            height=440
-        )
-        st.plotly_chart(fig_violin, use_container_width=True)
-
-        pr_df = pd.DataFrame([
-            {'Model': m,
-             'Median SCR': f"{df[df['evaluator_model']==m]['supported_claim_ratio'].median():.2f}",
-             'Pass Rate @ ÃƒÆ’Ã‚ÂÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾=0.70': f"{v:.0%}",
-             'Status': 'ÃƒÆ’Ã‚Â¢Ãƒâ€¦Ã¢â‚¬Å“ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ PASS' if v >= 0.5 else 'ÃƒÆ’Ã‚Â°Ãƒâ€¦Ã‚Â¸ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒâ€šÃ‚Â´ CHRONIC FAIL'}
-            for m, v in sorted(pass_rates.items(), key=lambda x: -x[1])
-        ])
-        st.dataframe(pr_df, hide_index=True, use_container_width=False)
-        st.caption(
-            "ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ **Violin** shows full score distribution shape ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â wide = high variance, narrow = model is stuck at one value. "
-            "ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ Embedded box shows median + IQR. ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ **Pass Rate** = fraction of sequences ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â°Ãƒâ€šÃ‚Â¥ ÃƒÆ’Ã‚ÂÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾=0.70."
-        )
-
-    # =====================================================================
-    # VIEW: FAILURE VELOCITY
-    # =====================================================================
-    elif view_mode == "FAILURE VELOCITY":
-        st.subheader("Failure Heatmap (Temporal Pattern)")
-
-        all_seqs = list(range(df['sequence_id'].min(), df['sequence_id'].max() + 1))
-        df_full = df.set_index(['evaluator_model', 'sequence_id']).reindex(
-            pd.MultiIndex.from_product([models, all_seqs], names=['evaluator_model', 'sequence_id'])
-        ).reset_index()
-
-        df_full['is_failure'] = (
-            df_full['supported_claim_ratio'].isna() |
-            (df_full['supported_claim_ratio'] < 0.6) |
-            (df_full['risk_score'] > 0.4)
-        ).astype(int)
-
-        heat_df = df_full.pivot(index='evaluator_model', columns='sequence_id', values='is_failure')
-
-        fig_heat = go.Figure(data=go.Heatmap(
-            z=heat_df.values,
-            x=heat_df.columns.tolist(),
-            y=heat_df.index.tolist(),
-            colorscale=[
-                [0.0, '#0d2137'],
-                [1.0, '#c0392b']
-            ],
-            zmin=0, zmax=1,
-            colorbar=dict(
-                tickvals=[0.1, 0.9],
-                ticktext=['PASS', 'FAIL'],
-                title='',
-                thickness=12,
-                len=0.6
-            ),
-            xgap=0.8,
-            ygap=3,
-            hovertemplate='Model: %{y}<br>Sequence: %{x}<br>Verdict: %{z}<extra></extra>'
-        ))
-        fig_heat.update_layout(
-            title=dict(text="Failure Pattern per Model ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â Sequence (SCR < 0.6 or Risk > 0.4)", font=dict(size=13)),
-            template="plotly_dark",
-            paper_bgcolor='#05070a',
-            plot_bgcolor='#0a0e14',
-            font=dict(family="JetBrains Mono"),
-            xaxis=dict(title="Sequence ID", gridcolor='rgba(0,0,0,0)'),
-            yaxis=dict(title=""),
-            height=260
-        )
-        st.plotly_chart(fig_heat, use_container_width=True)
-        st.caption(
-            "ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ **Red = FAIL** (SCR < 0.6 or risk_score > 0.4). **Navy = PASS**. "
-            "ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ Solid red rows = chronic failure. Alternating rows = intermittent failure. "
-            "ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ This chart is immune to flatline issues ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â shows raw pass/fail per sequence directly."
-        )
-
-        st.subheader("Rolling Burst Rates ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â Variable Models Only")
-        df_sorted = df_full.sort_values(by=['evaluator_model', 'sequence_id']).copy()
-        df_sorted['rolling_failure_rate'] = df_sorted.groupby('evaluator_model')['is_failure'].transform(
-            lambda x: x.rolling(window=10, min_periods=1).mean()
-        )
-        variable_models = [
-            m for m in models
-            if df_sorted[df_sorted['evaluator_model'] == m]['rolling_failure_rate'].std() > 0.05
+    filtered_df = df.copy()
+    filtered_df = filtered_df[filtered_df["evaluator_model"].astype(str).isin(selected_models)]
+    if "category" in filtered_df.columns:
+        filtered_df = filtered_df[
+            filtered_df["category"].map(_humanize_prompt_category).isin(selected_categories)
         ]
 
-        if variable_models:
-            fig_roll = go.Figure()
-            for model in variable_models:
-                mdf = df_sorted[df_sorted['evaluator_model'] == model]
-                color = model_color_map[model]
-                # FIX: Use hex_to_rgba() instead of color + '18'
-                fill_rgba = hex_to_rgba(color, alpha=0.09)
-                fig_roll.add_trace(go.Scatter(
-                    x=mdf['sequence_id'], y=mdf['rolling_failure_rate'],
-                    mode='lines', name=model,
-                    line=dict(color=color, width=2.5),
-                    fill='tozeroy',
-                    fillcolor=fill_rgba,   # FIXED: was color + '18'
-                ))
-            fig_roll.add_hline(
-                y=0.5, line_dash="dash",
-                line_color="rgba(255,80,80,0.6)", line_width=1.5,
-                annotation_text="Cascade Horizon (50%)",
-                annotation_position="top right",
-                annotation_font=dict(color="#ff5050", size=10)
-            )
-            fig_roll.update_layout(
-                template="plotly_dark",
-                paper_bgcolor='#05070a',
-                plot_bgcolor='#0a0e14',
-                font=dict(family="JetBrains Mono"),
-                title=dict(text="Rolling Failure Rate (w=10) ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â Models with Temporal Variation", font=dict(size=13)),
-                xaxis=dict(title="Sequence ID", gridcolor='rgba(255,255,255,0.05)'),
-                yaxis=dict(title="Rolling Failure Rate", range=[0, 1.05],
-                          tickformat='.0%', gridcolor='rgba(255,255,255,0.05)'),
-                legend=dict(title="Model", bgcolor='rgba(0,0,0,0.4)',
-                           bordercolor='rgba(255,255,255,0.1)', borderwidth=1),
-                height=360
-            )
-            st.plotly_chart(fig_roll, use_container_width=True)
-            omitted = [m for m in models if m not in variable_models]
-            if omitted:
-                st.caption(f"ÃƒÆ’Ã‚Â¢Ãƒâ€¦Ã‚Â¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã‚Â¯Ãƒâ€šÃ‚Â¸Ãƒâ€šÃ‚Â Omitted from burst chart (flatline ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â chronic failure with no temporal variance): **{', '.join(omitted)}**. See heatmap above for their pattern.")
-        else:
-            st.info("All models show chronic flatline behavior. See the heatmap above for the full failure pattern.")
-
-        st.subheader("Systemic Entropy Gradient (Derivative Slope)")
-
-        def calc_entropy(p):
-            if p <= 0 or p >= 1:
-                return 0.0
-            return -p * math.log2(p) - (1 - p) * math.log2(1 - p)
-
-        fig_slope = go.Figure()
-        for model in models:
-            mdf = df_sorted[df_sorted['evaluator_model'] == model].sort_values('sequence_id').copy()
-            mdf['entropy'] = mdf['is_failure'].rolling(window=5, min_periods=1).mean().apply(calc_entropy)
-            mdf['entropy_slope'] = mdf['entropy'].diff().fillna(0)
-            mdf['smoothed_slope'] = mdf['entropy_slope'].rolling(window=5, min_periods=1).mean()
-            color = model_color_map[model]
-            fig_slope.add_trace(go.Scatter(
-                x=mdf['sequence_id'], y=mdf['smoothed_slope'],
-                mode='lines', name=model,
-                line=dict(color=color, width=2),
-            ))
-
-        fig_slope.add_hline(y=0, line_color="rgba(255,255,255,0.25)", line_width=1)
-        fig_slope.update_layout(
-            template="plotly_dark",
-            paper_bgcolor='#05070a',
-            plot_bgcolor='#0a0e14',
-            font=dict(family="JetBrains Mono"),
-            title=dict(text="Risk Slope (ÃƒÆ’Ã…Â½ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂEntropy/ÃƒÆ’Ã…Â½ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂSequence Timeline)", font=dict(size=14)),
-            xaxis=dict(title="sequence_id", gridcolor='rgba(255,255,255,0.06)'),
-            yaxis=dict(title="entropy_slope", gridcolor='rgba(255,255,255,0.06)'),
-            legend=dict(title="evaluator_model", bgcolor='rgba(0,0,0,0.4)',
-                       bordercolor='rgba(255,255,255,0.1)', borderwidth=1),
-            height=400
-        )
-        st.plotly_chart(fig_slope, use_container_width=True)
-        st.caption(
-            "ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ **Inputs:** `risk_score` trajectory per model. "
-            "ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ **Parameters:** Difference lag = 1. "
-            "ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ **Computation:** ÃƒÆ’Ã…Â½ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂH(t) = H(t) - H(t-1) indicating immediate sharp systemic saturation events."
-        )
-
-    # =====================================================================
-    # VIEW: COUNCIL DECISION ROOM
-    # =====================================================================
-    elif view_mode == "COUNCIL DECISION ROOM":
-        st.subheader("LLM Council Diagnostics (Consensus Overview)")
-        df['council_fail'] = (df['supported_claim_ratio'] < 0.6) | (df['risk_score'] > 0.4)
-
-        c_df = df.pivot(index='sequence_id', columns='evaluator_model', values='council_fail').dropna()
-        if not c_df.empty:
-            consensus_mask = c_df.sum(axis=1).isin([0, len(models)])
-            consensus_rate = consensus_mask.mean() * 100
-            dissent_severity = c_df[~consensus_mask].var(axis=1).mean() * 100
-
-            mc1, mc2, mc3 = st.columns(3)
-            mc1.metric("COUNCIL CONSENSUS RATE", f"{consensus_rate:.1f}%", delta="UNANIMITY", delta_color="normal")
-            mc2.metric("COUNCIL DISSENT RATE", f"{100 - consensus_rate:.1f}%", delta="HIGH DISSENT", delta_color="inverse")
-            mc3.metric("DISSENT SEVERITY", f"{dissent_severity:.2f}",
-                       delta="WARNING" if dissent_severity > 20 else "OK", delta_color="inverse")
-
-            st.subheader("Vote Matrix (Single Pane of Truth)")
-
-            vote_matrix = c_df.T.astype(int)
-
-            fig_matrix = go.Figure(data=go.Heatmap(
-                z=vote_matrix.values,
-                x=vote_matrix.columns.tolist(),
-                y=vote_matrix.index.tolist(),
-                colorscale=[
-                    [0.0, '#1a3a6b'],
-                    [0.5, '#1a3a6b'],
-                    [0.5, '#8b0000'],
-                    [1.0, '#8b0000']
-                ],
-                zmin=0, zmax=1,
-                colorbar=dict(
-                    tickvals=[0.25, 0.75],
-                    ticktext=['PASS', 'FAIL'],
-                    title='Verdict',
-                    thickness=15
-                ),
-                xgap=0.5,
-                ygap=2
-            ))
-            fig_matrix.update_layout(
-                title="Council Verdict Matrix (1=FAIL, 0=PASS) per Sequence",
-                template="plotly_dark",
-                font=dict(family="JetBrains Mono"),
-                xaxis_title="sequence_id",
-                yaxis_title="evaluator_model",
-                height=320
-            )
-            st.plotly_chart(fig_matrix, use_container_width=True)
-            st.caption(
-                "ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ **Inputs:** Boolean evaluation verdict matching across all cluster nodes. "
-                "ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ **Parameters:** 1.0 (Fail) vs 0.0 (Pass). "
-                "ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ **Computation:** Aggregated cross-model voting record matrix. "
-                "Highlights exactly where nodes diverge on adversarial prompts."
-            )
-
-            st.subheader("Event Raster (Failure Tick Plot)")
-            tick_df = c_df.reset_index().melt(id_vars='sequence_id', var_name='evaluator_model', value_name='council_fail')
-            tick_df = tick_df[tick_df['council_fail'] == True]
-
-            fig_raster = px.scatter(
-                tick_df, x='sequence_id', y='evaluator_model',
-                color='evaluator_model',
-                symbol_sequence=['line-ns-open'],
-                title="Council Verdict Failures per Sequence (Tick Raster)",
-                labels={'sequence_id': 'Sequence ID', 'evaluator_model': ''}
-            )
-            fig_raster.update_traces(marker=dict(size=18, line=dict(width=3)))
-            fig_raster.update_layout(
-                template="plotly_dark",
-                font=dict(family="JetBrains Mono"),
-                showlegend=False,
-                yaxis=dict(title='', tickfont=dict(size=11))
-            )
-            st.plotly_chart(fig_raster, use_container_width=True)
-            st.caption(
-                "ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ **What it shows:** Per-sequence FAIL events by model. Dense alignments show council-wide reality collapse. "
-                "ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ **Parameters:** Verdict mapping (pass=0, fail=1). "
-                "ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¢ **Interpretation:** Instantly highlights edge-case vulnerabilities vs catastrophic group-think."
-            )
-
+if df is None or df.empty:
+    st.title("LLM Council Evaluation Dashboard")
+    st.error(f"No evaluation dataset found at {dataset_path}.")
+    st.info("Run the evaluation suite once, then reload this page to inspect aggregated reliability results.")
+elif filtered_df is None or filtered_df.empty:
+    st.title("LLM Council Evaluation Dashboard")
+    st.warning("No evaluation rows matched the current model/category filters.")
 else:
-    st.title("RAG-LLM Reliability Evaluation and Governance Framework")
-    st.error("No experiment data found for comparison.")
-    st.info("Council Chat is available without historical experiment data. Run the stress test to unlock the diagnostic views.")
+    render_evaluation_dashboard(filtered_df, dataset_path)
+
+if show_query_playground:
+    st.divider()
+    with st.expander("Optional Query Playground", expanded=False):
+        render_council_chat(df, embedded=True)

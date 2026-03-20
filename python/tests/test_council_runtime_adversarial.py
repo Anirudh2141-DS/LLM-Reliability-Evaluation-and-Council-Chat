@@ -7,7 +7,7 @@ from typing import Optional
 
 from pydantic import BaseModel
 
-from rlrgf.council_runtime import CouncilRuntime
+from rlrgf.council_runtime import CouncilRuntime, normalize_user_visible_answer_text
 from rlrgf.council_runtime_config import CouncilRuntimeConfig
 from rlrgf.council_runtime_inference_adapter import RemoteInferenceResult
 from rlrgf.council_runtime_schemas import (
@@ -18,6 +18,7 @@ from rlrgf.council_runtime_schemas import (
     CouncilRunTrace,
     CouncilSeat,
     CouncilStage,
+    ExecutionMode,
     FailureFlag,
     FinalSynthesisPayload,
     InitialAnswerPayload,
@@ -41,7 +42,7 @@ class _ScriptedAdapter:
     def __init__(
         self,
         *,
-        outcomes: Optional[dict[tuple[str, str], _Outcome]] = None,
+        outcomes: Optional[dict[tuple[str, str], _Outcome | list[_Outcome]]] = None,
         initial_conf_by_model: Optional[dict[str, float]] = None,
         initial_answer_by_model: Optional[dict[str, str]] = None,
     ) -> None:
@@ -67,6 +68,8 @@ class _ScriptedAdapter:
         outcome = self._outcomes.get((schema_name, model_id)) or self._outcomes.get(
             (schema_name, "*")
         )
+        if isinstance(outcome, list):
+            outcome = outcome.pop(0) if outcome else None
         if outcome is not None:
             result = RemoteInferenceResult(
                 status=outcome.status,
@@ -229,12 +232,14 @@ def _run(
     query: str = "How should we secure a RAG system?",
     demo_mode: bool = False,
     force_live_rerun: bool = False,
+    execution_mode: ExecutionMode = ExecutionMode.BENCHMARK,
 ) -> CouncilRunTrace:
     runtime = CouncilRuntime(config=_runtime_config(tmp_path / "cache.json"), adapter=adapter)
     return runtime.run(
         CouncilRequest(
             query=query,
             mode=mode,
+            execution_mode=execution_mode,
             demo_mode=demo_mode,
             force_live_rerun=force_live_rerun,
         )
@@ -368,6 +373,170 @@ def test_synthesis_json_malformed_falls_back(tmp_path: Path) -> None:
     assert any(f.flag == FailureFlag.SYNTHESIS_FAILURE for f in trace.failures)
 
 
+def test_normalize_user_visible_answer_text_rejects_internal_schema_blobs() -> None:
+    @dataclass
+    class _AnswerWrapper:
+        final_answer: str
+
+    assert normalize_user_visible_answer_text(_AnswerWrapper("clean answer")) == "clean answer"
+    assert (
+        normalize_user_visible_answer_text(
+            {
+                "final_answer": "extracted answer",
+                "confidence": 0.9,
+                "winner_seat_ids": ["seat-a"],
+            }
+        )
+        == "extracted answer"
+    )
+    assert (
+        normalize_user_visible_answer_text(
+            '{"title":"FinalSynthesisPayload","type":"object","properties":{"final_answer":{"type":"string"}}}'
+        )
+        == ""
+    )
+    assert (
+        normalize_user_visible_answer_text(
+            "FinalSynthesisPayload(final_answer='leak', confidence=0.8)"
+        )
+        == ""
+    )
+
+
+def test_interactive_numeric_conflict_prefers_direct_answer(tmp_path: Path) -> None:
+    adapter = _ScriptedAdapter(
+        initial_answer_by_model={"model-a": "9 sheep are left."},
+        outcomes={
+            ("FinalSynthesisPayload", "model-a"): _Outcome(
+                payload=FinalSynthesisPayload(
+                    final_answer="8 sheep are left.",
+                    reasoning_summary="All but 9 die means 8 remain.",
+                    winner_seat_ids=["seat-a"],
+                    strongest_contributors=["seat-a"],
+                    uncertainty_notes=[],
+                    cited_risk_notes=[],
+                    confidence=0.91,
+                )
+            )
+        },
+    )
+    trace = _run(
+        tmp_path,
+        mode=CouncilMode.FAST_COUNCIL,
+        adapter=adapter,
+        query="A farmer has 17 sheep and all but 9 die. How many are left?",
+        execution_mode=ExecutionMode.INTERACTIVE,
+    )
+
+    assert trace.final_synthesis is not None
+    assert trace.final_synthesis.final_answer == "9 sheep are left."
+    assert trace.final_synthesis.fallback_used is False
+    assert [entry.stage for entry in trace.transcript] == [
+        CouncilStage.INITIAL_ANSWER,
+        CouncilStage.SYNTHESIS,
+    ]
+
+
+def test_interactive_invalid_synthesis_retries_once_then_succeeds(tmp_path: Path) -> None:
+    adapter = _ScriptedAdapter(
+        initial_answer_by_model={"model-a": "def top_k(nums, k): return nums[:k]"},
+        outcomes={
+            ("FinalSynthesisPayload", "model-a"): [
+                _Outcome(
+                    payload=FinalSynthesisPayload(
+                        final_answer='{"title":"FinalSynthesisPayload","type":"object","properties":{"final_answer":{"type":"string"}}}',
+                        reasoning_summary="schema leak",
+                        winner_seat_ids=["seat-a"],
+                        strongest_contributors=["seat-a"],
+                        uncertainty_notes=[],
+                        cited_risk_notes=[],
+                        confidence=0.5,
+                    )
+                ),
+                _Outcome(
+                    payload=FinalSynthesisPayload(
+                        final_answer=(
+                            "Use a frequency map plus bucket sort to return the top k "
+                            "elements in O(n) average time."
+                        ),
+                        reasoning_summary="Returned a user-facing explanation only.",
+                        winner_seat_ids=["seat-a"],
+                        strongest_contributors=["seat-a"],
+                        uncertainty_notes=[],
+                        cited_risk_notes=[],
+                        confidence=0.8,
+                    )
+                ),
+            ]
+        },
+    )
+    trace = _run(
+        tmp_path,
+        mode=CouncilMode.FAST_COUNCIL,
+        adapter=adapter,
+        query="Write a Python function that returns the top k most frequent elements.",
+        execution_mode=ExecutionMode.INTERACTIVE,
+    )
+
+    assert trace.final_synthesis is not None
+    assert _count_calls(adapter, "FinalSynthesisPayload") == 2
+    assert trace.final_synthesis.fallback_used is False
+    assert "FinalSynthesisPayload" not in trace.final_synthesis.final_answer
+    assert trace.final_synthesis.final_answer.startswith("Use a frequency map")
+
+
+def test_interactive_invalid_synthesis_falls_back_to_best_initial_answer(
+    tmp_path: Path,
+) -> None:
+    adapter = _ScriptedAdapter(
+        initial_answer_by_model={"model-a": "def top_k(nums, k): return nums[:k]"},
+        outcomes={
+            ("FinalSynthesisPayload", "model-a"): [
+                _Outcome(
+                    payload=FinalSynthesisPayload(
+                        final_answer='{"title":"FinalSynthesisPayload","type":"object","properties":{"final_answer":{"type":"string"}}}',
+                        reasoning_summary="schema leak",
+                        winner_seat_ids=["seat-a"],
+                        strongest_contributors=["seat-a"],
+                        uncertainty_notes=[],
+                        cited_risk_notes=[],
+                        confidence=0.5,
+                    )
+                ),
+                _Outcome(
+                    payload=FinalSynthesisPayload(
+                        final_answer="FinalSynthesisPayload(final_answer='leak')",
+                        reasoning_summary="repr leak",
+                        winner_seat_ids=["seat-a"],
+                        strongest_contributors=["seat-a"],
+                        uncertainty_notes=[],
+                        cited_risk_notes=[],
+                        confidence=0.5,
+                    )
+                ),
+            ]
+        },
+    )
+    trace = _run(
+        tmp_path,
+        mode=CouncilMode.FAST_COUNCIL,
+        adapter=adapter,
+        query="Write a Python function that returns the top k most frequent elements.",
+        execution_mode=ExecutionMode.INTERACTIVE,
+    )
+
+    assert trace.final_synthesis is not None
+    assert _count_calls(adapter, "FinalSynthesisPayload") == 2
+    assert trace.final_synthesis.fallback_used is True
+    assert trace.final_synthesis.final_answer == "def top_k(nums, k): return nums[:k]"
+    assert "FinalSynthesisPayload" not in trace.final_synthesis.final_answer
+    assert any(
+        failure.stage == CouncilStage.SYNTHESIS
+        and failure.flag == FailureFlag.SYNTHESIS_FAILURE
+        for failure in trace.failures
+    )
+
+
 def test_escalation_from_three_fast_to_five_full_triggers(tmp_path: Path) -> None:
     adapter = _ScriptedAdapter(
         initial_conf_by_model={"model-a": 0.2, "model-c": 0.2, "model-e": 0.2}
@@ -376,6 +545,43 @@ def test_escalation_from_three_fast_to_five_full_triggers(tmp_path: Path) -> Non
 
     assert trace.escalated_to_full is True
     assert _count_calls(adapter, "InitialAnswerPayload") == 5
+
+
+def test_benchmark_all_seats_unavailable_returns_explicit_unavailable_message(
+    tmp_path: Path,
+) -> None:
+    adapter = _ScriptedAdapter(
+        outcomes={
+            ("InitialAnswerPayload", "*"): _Outcome(
+                status="unavailable",
+                error="HTTP 402: Provider credits exhausted.",
+            )
+        }
+    )
+    trace = _run(
+        tmp_path,
+        mode=CouncilMode.FULL_COUNCIL,
+        adapter=adapter,
+        query="Design a production-ready LLM evaluation system.",
+        execution_mode=ExecutionMode.BENCHMARK,
+    )
+
+    assert trace.final_synthesis is not None
+    assert trace.final_synthesis.fallback_used is True
+    assert "Benchmark execution could not complete" in trace.final_synthesis.final_answer
+    assert trace.observability.number_of_models_requested == 5
+    assert trace.observability.number_of_models_succeeded == 0
+    assert trace.observability.number_of_models_failed == 5
+    assert trace.observability.critique_enabled is False
+    assert not any(
+        entry.stage == CouncilStage.PEER_CRITIQUE for entry in trace.transcript
+    )
+    assert any(
+        failure.flag == FailureFlag.UNAVAILABLE_MODEL for failure in trace.failures
+    )
+    assert not any(
+        failure.flag == FailureFlag.MALFORMED_JSON for failure in trace.failures
+    )
 
 
 def test_escalation_is_skipped_when_fast_run_is_confident_and_consistent(
